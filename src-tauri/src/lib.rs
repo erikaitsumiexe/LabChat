@@ -1,9 +1,9 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use crypto::CryptoSession;
 use discovery::Peer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 use tokio::fs;
@@ -33,6 +33,37 @@ pub struct FilePreviewResponse {
     pub file_size: u64,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct IdentityStore {
+    users: HashMap<String, String>,
+}
+
+fn identity_file_path() -> PathBuf {
+    let dir = std::env::temp_dir().join("labchat_state");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("identity.json")
+}
+
+async fn get_or_create_persistent_id(username: &str) -> String {
+    let path = identity_file_path();
+    let mut store = if let Ok(bytes) = fs::read(&path).await {
+        serde_json::from_slice::<IdentityStore>(&bytes).unwrap_or_default()
+    } else {
+        IdentityStore::default()
+    };
+
+    if let Some(existing_id) = store.users.get(username) {
+        return existing_id.clone();
+    }
+
+    let new_id = Uuid::new_v4().to_string();
+    store.users.insert(username.to_string(), new_id.clone());
+    if let Ok(json) = serde_json::to_vec_pretty(&store) {
+        let _ = fs::write(&path, json).await;
+    }
+    new_id
+}
+
 #[tauri::command]
 async fn join_room(
     app: AppHandle,
@@ -40,14 +71,14 @@ async fn join_room(
     username: String,
     room_password: String,
 ) -> Result<(), String> {
-    println!("Backend: {} giriş yaptı. X25519 ve Outbox başlatılıyor...", username);
-
     let mut started = state.started.lock().await;
     if *started {
         return Ok(());
     }
 
-    let my_id = Uuid::new_v4().to_string();
+    let my_id = get_or_create_persistent_id(&username).await;
+    println!("Backend: {} ({}) giriş yaptı. X25519 ve Outbox başlatılıyor...", username, my_id);
+
     *state.my_id.lock().await = my_id.clone();
     *state.my_username.lock().await = username.clone();
 
@@ -133,15 +164,7 @@ async fn send_message(
                 }
             }
 
-            if delivered_now {
-                let _ = app.emit(
-                    "message-status",
-                    MessageStatus {
-                        msg_id: msg_id.clone(),
-                        status: "sent".to_string(),
-                    },
-                );
-            } else {
+            if !delivered_now {
                 let real_target_id = peer_opt.map(|p| p.id).unwrap_or(target);
                 transport::enqueue_outbox(
                     &state.outbox,
@@ -178,13 +201,6 @@ async fn send_message(
             for peer in peers_map.values().filter(|p| p.online) {
                 let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
-            let _ = app.emit(
-                "message-status",
-                MessageStatus {
-                    msg_id: msg_id.clone(),
-                    status: "sent".to_string(),
-                },
-            );
         }
     }
 
@@ -246,15 +262,7 @@ async fn send_file_internal(
                 }
             }
 
-            if delivered_now {
-                let _ = app.emit(
-                    "message-status",
-                    MessageStatus {
-                        msg_id: msg_id.clone(),
-                        status: "sent".to_string(),
-                    },
-                );
-            } else {
+            if !delivered_now {
                 let real_target_id = peer_opt.map(|p| p.id).unwrap_or(target);
                 transport::enqueue_outbox(
                     &state.outbox,
@@ -292,13 +300,6 @@ async fn send_file_internal(
             for peer in peers_map.values().filter(|p| p.online) {
                 let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
-            let _ = app.emit(
-                "message-status",
-                MessageStatus {
-                    msg_id: msg_id.clone(),
-                    status: "sent".to_string(),
-                },
-            );
         }
     }
 
