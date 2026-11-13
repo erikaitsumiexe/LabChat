@@ -11,12 +11,14 @@ pub struct Peer {
     pub id: String,
     pub username: String,
     pub ip: String,
+    pub public_key: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
 struct AnnouncePacket {
     id: String,
     username: String,
+    public_key: [u8; 32],
 }
 
 const DISCOVERY_PORT: u16 = 54321;
@@ -25,6 +27,7 @@ pub async fn start_discovery(
     app: AppHandle,
     my_id: String,
     my_username: String,
+    my_public_key: [u8; 32],
     peers: Arc<Mutex<HashMap<String, Peer>>>,
 ) {
     let listen_socket = UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT))
@@ -42,7 +45,7 @@ pub async fn start_discovery(
     let my_id_clone = my_id.clone();
 
     tokio::spawn(async move {
-        let mut buf = [0; 1024];
+        let mut buf = [0; 2048];
         loop {
             if let Ok((len, addr)) = listen_socket.recv_from(&mut buf).await {
                 if let Ok(packet) = serde_json::from_slice::<AnnouncePacket>(&buf[..len]) {
@@ -51,7 +54,9 @@ pub async fn start_discovery(
                         let peer_ip = addr.ip().to_string();
                         let should_emit = match p_map.get(&packet.id) {
                             Some(existing) => {
-                                existing.username != packet.username || existing.ip != peer_ip
+                                existing.username != packet.username
+                                    || existing.ip != peer_ip
+                                    || existing.public_key != packet.public_key
                             }
                             None => true,
                         };
@@ -62,6 +67,7 @@ pub async fn start_discovery(
                                 id: packet.id,
                                 username: packet.username,
                                 ip: peer_ip,
+                                public_key: packet.public_key,
                             },
                         );
 
@@ -79,6 +85,7 @@ pub async fn start_discovery(
         let announce = AnnouncePacket {
             id: my_id,
             username: my_username,
+            public_key: my_public_key,
         };
         let msg = serde_json::to_string(&announce).unwrap();
         loop {

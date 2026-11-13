@@ -5,9 +5,11 @@ export interface Peer {
   id: string;
   username: string;
   ip: string;
+  public_key?: number[];
 }
 
 export interface ReceivedMessage {
+  msg_id: string;
   sender_id: string;
   sender_name: string;
   text: string;
@@ -16,12 +18,18 @@ export interface ReceivedMessage {
 }
 
 export interface ReceivedFile {
+  msg_id: string;
   sender_id: string;
   sender_name: string;
   file_path: string;
   file_name: string;
   timestamp: string;
   is_private: boolean;
+}
+
+export interface MessageAck {
+  msg_id: string;
+  sender_id: string;
 }
 
 export interface FilePreviewResponse {
@@ -36,12 +44,12 @@ export const bridge = {
     await invoke("join_room", { username, roomPassword });
   },
 
-  sendMessage: async (targetId: string | null, text: string): Promise<void> => {
-    await invoke("send_message", { targetId, text });
+  sendMessage: async (targetId: string | null, text: string): Promise<string> => {
+    return await invoke<string>("send_message", { targetId, text });
   },
 
-  sendFile: async (targetId: string | null, filePath: string): Promise<void> => {
-    await invoke("send_file", { targetId, filePath });
+  sendFile: async (targetId: string | null, filePath: string): Promise<string> => {
+    return await invoke<string>("send_file", { targetId, filePath });
   },
 
   readFilePreview: async (filePath: string): Promise<FilePreviewResponse> => {
@@ -74,6 +82,12 @@ export const bridge = {
 
   onFileReceived: async (callback: (file: ReceivedFile) => void): Promise<UnlistenFn> => {
     return await listen<ReceivedFile>("file-received", (event) => {
+      callback(event.payload);
+    });
+  },
+
+  onMessageAck: async (callback: (ack: MessageAck) => void): Promise<UnlistenFn> => {
+    return await listen<MessageAck>("message-ack", (event) => {
       callback(event.payload);
     });
   }

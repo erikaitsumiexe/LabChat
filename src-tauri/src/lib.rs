@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use crypto::CryptoSession;
 use discovery::Peer;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -18,6 +19,7 @@ struct AppState {
     my_id: Mutex<String>,
     my_username: Mutex<String>,
     room_key: Mutex<[u8; 32]>,
+    crypto_session: Mutex<Option<CryptoSession>>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
     started: Mutex<bool>,
 }
@@ -30,6 +32,12 @@ pub struct FilePreviewResponse {
     pub file_size: u64,
 }
 
+#[derive(Serialize)]
+pub struct ClipboardSendResponse {
+    pub msg_id: String,
+    pub file_path: String,
+}
+
 #[tauri::command]
 async fn join_room(
     app: AppHandle,
@@ -37,7 +45,7 @@ async fn join_room(
     username: String,
     room_password: String,
 ) -> Result<(), String> {
-    println!("Backend: {} giriş yaptı. Oda Parolası işleniyor...", username);
+    println!("Backend: {} giriş yaptı. X25519 oturumu başlatılıyor...", username);
 
     let mut started = state.started.lock().await;
     if *started {
@@ -51,8 +59,19 @@ async fn join_room(
     let key = crypto::derive_room_key(&room_password);
     *state.room_key.lock().await = key;
 
-    discovery::start_discovery(app.clone(), my_id, username, state.peers.clone()).await;
-    transport::start_tcp_server(app, key).await;
+    let session = CryptoSession::new();
+    let pub_key_bytes = session.public_key.to_bytes();
+    *state.crypto_session.lock().await = Some(session.clone());
+
+    discovery::start_discovery(
+        app.clone(),
+        my_id.clone(),
+        username,
+        pub_key_bytes,
+        state.peers.clone(),
+    )
+    .await;
+    transport::start_tcp_server(app, my_id, key, session, state.peers.clone()).await;
 
     *started = true;
     Ok(())
@@ -63,12 +82,19 @@ async fn send_message(
     state: State<'_, AppState>,
     target_id: Option<String>,
     text: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let my_id = state.my_id.lock().await.clone();
     let my_username = state.my_username.lock().await.clone();
-    let key = *state.room_key.lock().await;
+    let room_key = *state.room_key.lock().await;
+    let session = state
+        .crypto_session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Oturum henüz başlatılmadı!".to_string())?;
     let peers_map = state.peers.lock().await.clone();
     let timestamp = transport::current_time_str();
+    let msg_id = Uuid::new_v4().to_string();
 
     match target_id {
         Some(target) => {
@@ -77,17 +103,20 @@ async fn send_message(
                 .find(|p| p.id == target || p.ip == target)
                 .ok_or_else(|| "Hedef kullanıcı ağda bulunamadı!".to_string())?;
 
+            let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
             let packet = NetworkPacket::Text {
+                msg_id: msg_id.clone(),
                 sender_id: my_id,
                 sender_name: my_username,
                 text,
                 timestamp,
                 is_private: true,
             };
-            transport::send_packet(&peer.ip, key, &packet).await?;
+            transport::send_packet(&peer.ip, dm_key, &packet).await?;
         }
         None => {
             let packet = NetworkPacket::Text {
+                msg_id: msg_id.clone(),
                 sender_id: my_id,
                 sender_name: my_username,
                 text,
@@ -95,24 +124,31 @@ async fn send_message(
                 is_private: false,
             };
             for peer in peers_map.values() {
-                let _ = transport::send_packet(&peer.ip, key, &packet).await;
+                let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
         }
     }
 
-    Ok(())
+    Ok(msg_id)
 }
 
 async fn send_file_internal(
     state: &AppState,
     target_id: Option<String>,
     file_path: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let my_id = state.my_id.lock().await.clone();
     let my_username = state.my_username.lock().await.clone();
-    let key = *state.room_key.lock().await;
+    let room_key = *state.room_key.lock().await;
+    let session = state
+        .crypto_session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Oturum henüz başlatılmadı!".to_string())?;
     let peers_map = state.peers.lock().await.clone();
     let timestamp = transport::current_time_str();
+    let msg_id = Uuid::new_v4().to_string();
 
     let data = fs::read(file_path)
         .await
@@ -131,7 +167,9 @@ async fn send_file_internal(
                 .find(|p| p.id == target || p.ip == target)
                 .ok_or_else(|| "Hedef kullanıcı ağda bulunamadı!".to_string())?;
 
+            let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
             let packet = NetworkPacket::File {
+                msg_id: msg_id.clone(),
                 sender_id: my_id,
                 sender_name: my_username,
                 file_name,
@@ -139,10 +177,11 @@ async fn send_file_internal(
                 timestamp,
                 is_private: true,
             };
-            transport::send_packet(&peer.ip, key, &packet).await?;
+            transport::send_packet(&peer.ip, dm_key, &packet).await?;
         }
         None => {
             let packet = NetworkPacket::File {
+                msg_id: msg_id.clone(),
                 sender_id: my_id,
                 sender_name: my_username,
                 file_name,
@@ -151,12 +190,12 @@ async fn send_file_internal(
                 is_private: false,
             };
             for peer in peers_map.values() {
-                let _ = transport::send_packet(&peer.ip, key, &packet).await;
+                let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
         }
     }
 
-    Ok(())
+    Ok(msg_id)
 }
 
 #[tauri::command]
@@ -164,7 +203,7 @@ async fn send_file(
     state: State<'_, AppState>,
     target_id: Option<String>,
     file_path: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     send_file_internal(&state, target_id, &file_path).await
 }
 
@@ -275,7 +314,7 @@ async fn send_clipboard_image(
         .map_err(|e| format!("Görsel diske yazılamadı: {}", e))?;
 
     let saved_path_str = saved_path.to_string_lossy().to_string();
-    send_file_internal(&state, target_id, &saved_path_str).await?;
+    let _msg_id = send_file_internal(&state, target_id, &saved_path_str).await?;
 
     Ok(saved_path_str)
 }
@@ -289,6 +328,7 @@ pub fn run() {
             my_id: Mutex::new(String::new()),
             my_username: Mutex::new(String::new()),
             room_key: Mutex::new([0u8; 32]),
+            crypto_session: Mutex::new(None),
             peers: Arc::new(Mutex::new(HashMap::new())),
             started: Mutex::new(false),
         })

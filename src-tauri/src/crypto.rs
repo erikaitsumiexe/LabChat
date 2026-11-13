@@ -3,26 +3,29 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
 };
 use rand::{rngs::OsRng, RngCore};
-use x25519_dalek::{EphemeralSecret, PublicKey};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 pub fn derive_room_key(password: &str) -> [u8; 32] {
     *blake3::hash(password.as_bytes()).as_bytes()
 }
 
+#[derive(Clone)]
 pub struct CryptoSession {
-    secret: EphemeralSecret,
+    secret: StaticSecret,
     pub public_key: PublicKey,
 }
 
 impl CryptoSession {
     pub fn new() -> Self {
-        let secret = EphemeralSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random_from_rng(OsRng);
         let public_key = PublicKey::from(&secret);
         Self { secret, public_key }
     }
 
-    pub fn compute_shared_secret(self, peer_pub_key: &PublicKey) -> [u8; 32] {
-        *self.secret.diffie_hellman(peer_pub_key).as_bytes()
+    pub fn compute_dm_key(&self, peer_pub_bytes: &[u8; 32], room_key: &[u8; 32]) -> [u8; 32] {
+        let peer_pub = PublicKey::from(*peer_pub_bytes);
+        let shared = self.secret.diffie_hellman(&peer_pub);
+        *blake3::keyed_hash(room_key, shared.as_bytes()).as_bytes()
     }
 }
 
