@@ -1,6 +1,29 @@
 import { useState, useEffect, useRef, FormEvent } from 'react';
-import { Terminal, Users, Send, Paperclip, Lock, ShieldAlert, Wifi, Key, X, Hash, MessageSquare } from 'lucide-react';
+import {
+  Shield,
+  Users,
+  Send,
+  Paperclip,
+  Lock,
+  Wifi,
+  Key,
+  X,
+  Hash,
+  MessageSquare,
+  Copy,
+  Check,
+  FileText,
+  ArrowUpRight,
+  ArrowDownLeft,
+  LogOut,
+  Clock,
+  Terminal,
+  Search,
+  UploadCloud,
+  Command
+} from 'lucide-react';
 import { UnlistenFn } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
 import { bridge, Peer } from './services/bridge';
 
@@ -11,13 +34,21 @@ interface ChatTab {
   hasUnread: boolean;
 }
 
+interface FileAttachment {
+  fileName: string;
+  filePath: string;
+  direction: 'sent' | 'received';
+}
+
 interface ChatMessage {
+  id: string;
   sender_id: string;
   sender_name: string;
   text: string;
   timestamp: string;
   isMine: boolean;
   isSystem?: boolean;
+  file?: FileAttachment;
 }
 
 interface IncomingMessagePayload {
@@ -37,16 +68,51 @@ interface IncomingFilePayload {
   is_private?: boolean;
 }
 
+interface QuickActionItem {
+  id: string;
+  label: string;
+  sublabel: string;
+  category: 'Sekmeler' | 'Cihazlar' | 'Komutlar';
+  onSelect: () => void;
+}
+
 const GROUP_TAB_ID = 'group';
+
+function formatUptime(totalSeconds: number): string {
+  const hrs = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  return [hrs, mins, secs].map((v) => String(v).padStart(2, '0')).join(':');
+}
+
+function isCodeMessage(text: string): boolean {
+  return (
+    text.includes('\n') ||
+    text.includes('```') ||
+    (text.startsWith('`') && text.endsWith('`') && text.length > 2)
+  );
+}
+
+function cleanCodeContent(text: string): string {
+  if (text.startsWith('```') && text.endsWith('```')) {
+    return text.replace(/^```[\w-]*\n?/, '').replace(/\n?```$/, '');
+  }
+  if (text.startsWith('`') && text.endsWith('`')) {
+    return text.slice(1, -1);
+  }
+  return text;
+}
 
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [username, setUsername] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
+  const [uptimeSeconds, setUptimeSeconds] = useState(0);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const [peers, setPeers] = useState<Peer[]>([]);
   const [tabs, setTabs] = useState<ChatTab[]>([
-    { id: GROUP_TAB_ID, title: '# BROADCAST_ALL', isGroup: true, hasUnread: false }
+    { id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }
   ]);
   const [activeTabId, setActiveTabId] = useState<string>(GROUP_TAB_ID);
   const [histories, setHistories] = useState<Record<string, ChatMessage[]>>({
@@ -54,8 +120,15 @@ export default function App() {
   });
   const [inputText, setInputText] = useState('');
 
+  // Sürükle-Bırak ve Ctrl+K Komut Paleti State'leri
+  const [isDragging, setIsDragging] = useState(false);
+  const [isPaletteOpen, setIsPaletteOpen] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState('');
+  const [selectedIndex, setSelectedIndex] = useState(0);
+
   const activeTabRef = useRef<string>(GROUP_TAB_ID);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const paletteInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     activeTabRef.current = activeTabId;
@@ -65,6 +138,143 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [histories, activeTabId]);
 
+  // --- CANLI OTURUM SAYACI (UPTIME) ---
+  useEffect(() => {
+    if (!isLoggedIn) {
+      setUptimeSeconds(0);
+      return;
+    }
+
+    const timer = setInterval(() => {
+      setUptimeSeconds((prev) => prev + 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [isLoggedIn]);
+
+  // --- CTRL + K KLAVYE KISAYOLU ---
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setIsPaletteOpen((prev) => !prev);
+        setPaletteQuery('');
+        setSelectedIndex(0);
+      } else if (e.key === 'Escape') {
+        setIsPaletteOpen(false);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isLoggedIn]);
+
+  useEffect(() => {
+    if (isPaletteOpen) {
+      setTimeout(() => paletteInputRef.current?.focus(), 20);
+    }
+  }, [isPaletteOpen]);
+
+  // --- MASAÜSTÜ BİLDİRİM YARDIMCISI ---
+  const triggerDesktopNotification = (title: string, body: string, targetTabId: string) => {
+    if (typeof window === 'undefined' || !('Notification' in window)) return;
+    if (document.hasFocus()) return;
+
+    const showNotif = () => {
+      const notif = new Notification(title, { body });
+      notif.onclick = () => {
+        window.focus();
+        setActiveTabId(targetTabId);
+        setTabs((prev) =>
+          prev.map((t) => (t.id === targetTabId ? { ...t, hasUnread: false } : t))
+        );
+        notif.close();
+      };
+    };
+
+    if (Notification.permission === 'granted') {
+      showNotif();
+    } else if (Notification.permission !== 'denied') {
+      Notification.requestPermission().then((perm) => {
+        if (perm === 'granted') showNotif();
+      });
+    }
+  };
+
+  // --- ORTAK DOSYA GÖNDERİM YARDIMCISI (ATAÇ + SÜRÜKLE BIRAK) ---
+  const dispatchFileToTarget = async (filePath: string, customTargetTabId?: string) => {
+    const tabId = customTargetTabId || activeTabRef.current;
+    const targetId = tabId === GROUP_TAB_ID ? null : tabId;
+    const fileName = filePath.split(/[/\\]/).pop() || filePath;
+
+    await bridge.sendFile(targetId, filePath);
+
+    const fileMsg: ChatMessage = {
+      id: crypto.randomUUID(),
+      sender_id: 'me',
+      sender_name: username,
+      text: fileName,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }),
+      isMine: true,
+      file: {
+        fileName,
+        filePath,
+        direction: 'sent'
+      }
+    };
+
+    setHistories((prev) => ({
+      ...prev,
+      [tabId]: [...(prev[tabId] || []), fileMsg]
+    }));
+  };
+
+  // --- TAURI SÜRÜKLE-BIRAK (DRAG & DROP) DİNLEYİCİSİ ---
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    let unlistenDragDrop: UnlistenFn | undefined;
+
+    const setupDragDrop = async () => {
+      try {
+        unlistenDragDrop = await getCurrentWebview().onDragDropEvent(async (event) => {
+          const payload = event.payload;
+          if (payload.type === 'enter' || payload.type === 'over') {
+            setIsDragging(true);
+          } else if (payload.type === 'leave') {
+            setIsDragging(false);
+          } else if (payload.type === 'drop') {
+            setIsDragging(false);
+            if (payload.paths && payload.paths.length > 0) {
+              for (const filePath of payload.paths) {
+                try {
+                  await dispatchFileToTarget(filePath);
+                } catch (err) {
+                  console.error('Sürükle-bırak dosya gönderim hatası:', err);
+                }
+              }
+            }
+          }
+        });
+      } catch (err) {
+        console.error('Drag-drop dinleyicisi başlatılamadı:', err);
+      }
+    };
+
+    setupDragDrop();
+
+    return () => {
+      if (unlistenDragDrop) unlistenDragDrop();
+    };
+  }, [isLoggedIn, username]);
+
+  // --- EVENT LİSTENER KURULUMU ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -76,7 +286,9 @@ export default function App() {
       targetTabId: string,
       tabTitle: string,
       isPrivate: boolean,
-      newMsg: ChatMessage
+      newMsg: ChatMessage,
+      notifTitle: string,
+      notifBody: string
     ) => {
       setTabs((prevTabs) => {
         const exists = prevTabs.some((t) => t.id === targetTabId);
@@ -87,7 +299,7 @@ export default function App() {
             ...prevTabs,
             {
               id: targetTabId,
-              title: `@${tabTitle}`,
+              title: tabTitle,
               isGroup: false,
               hasUnread: !isCurrentlyActive
             }
@@ -105,6 +317,8 @@ export default function App() {
         ...prev,
         [targetTabId]: [...(prev[targetTabId] || []), newMsg]
       }));
+
+      triggerDesktopNotification(notifTitle, notifBody, targetTabId);
     };
 
     const setupListeners = async () => {
@@ -115,7 +329,7 @@ export default function App() {
             prevTabs.map((tab) => {
               if (tab.isGroup) return tab;
               const matchedPeer = updatedPeers.find((p) => p.id === tab.id);
-              return matchedPeer ? { ...tab, title: `@${matchedPeer.username}` } : tab;
+              return matchedPeer ? { ...tab, title: matchedPeer.username } : tab;
             })
           );
         });
@@ -126,13 +340,27 @@ export default function App() {
           const targetTabId = isPrivate ? msg.sender_id : GROUP_TAB_ID;
           const displayName = msg.sender_name || msg.sender_id;
 
-          handleIncomingItem(targetTabId, displayName, isPrivate, {
-            sender_id: msg.sender_id,
-            sender_name: displayName,
-            text: msg.text,
-            timestamp: msg.timestamp || new Date().toLocaleTimeString(),
-            isMine: false
-          });
+          handleIncomingItem(
+            targetTabId,
+            displayName,
+            isPrivate,
+            {
+              id: crypto.randomUUID(),
+              sender_id: msg.sender_id,
+              sender_name: displayName,
+              text: msg.text,
+              timestamp:
+                msg.timestamp ||
+                new Date().toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit'
+                }),
+              isMine: false
+            },
+            isPrivate ? `LabChat • @${displayName}` : `LabChat • Genel Kanal (${displayName})`,
+            msg.text
+          );
         });
 
         unlistenFiles = await bridge.onFileReceived((rawFile) => {
@@ -141,13 +369,34 @@ export default function App() {
           const targetTabId = isPrivate ? file.sender_id : GROUP_TAB_ID;
           const displayName = file.sender_name || file.sender_id;
 
-          handleIncomingItem(targetTabId, displayName, isPrivate, {
-            sender_id: file.sender_id,
-            sender_name: displayName,
-            text: `[DOSYA ALINDI]: ${file.file_name} (Kaydedildi: ${file.file_path})`,
-            timestamp: file.timestamp || new Date().toLocaleTimeString(),
-            isMine: false
-          });
+          handleIncomingItem(
+            targetTabId,
+            displayName,
+            isPrivate,
+            {
+              id: crypto.randomUUID(),
+              sender_id: file.sender_id,
+              sender_name: displayName,
+              text: file.file_name,
+              timestamp:
+                file.timestamp ||
+                new Date().toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit'
+                }),
+              isMine: false,
+              file: {
+                fileName: file.file_name,
+                filePath: file.file_path,
+                direction: 'received'
+              }
+            },
+            isPrivate
+              ? `LabChat • @${displayName} dosya gönderdi`
+              : `LabChat • Genel Kanala Dosya Geldi`,
+            file.file_name
+          );
         });
       } catch (error) {
         console.error('Listener başlatılırken hata oluştu:', error);
@@ -163,20 +412,45 @@ export default function App() {
     };
   }, [isLoggedIn]);
 
+  // --- KOPYALAMA YARDIMCISI ---
+  const handleCopy = async (id: string, content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedId(id);
+      setTimeout(() => {
+        setCopiedId((prev) => (prev === id ? null : prev));
+      }, 1500);
+    } catch (err) {
+      console.error('Panoya kopyalanamadı:', err);
+    }
+  };
+
+  // --- GİRİŞ VE ÇIKIŞ ---
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
     if (!username.trim() || !roomPassword.trim()) return;
 
     try {
+      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission().catch(() => {});
+      }
+
       await bridge.joinRoom(username, roomPassword);
       setIsLoggedIn(true);
+      setActiveTabId(GROUP_TAB_ID);
+      setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
       setHistories({
         [GROUP_TAB_ID]: [
           {
+            id: crypto.randomUUID(),
             sender_id: 'SYSTEM',
-            sender_name: 'SYSTEM',
-            text: 'Bağlantı kuruldu. Ağ dinleniyor...',
-            timestamp: new Date().toLocaleTimeString(),
+            sender_name: 'Sistem',
+            text: 'P2P şifreli ağ bağlantısı kuruldu. Komut listesi için /help, hızlı geçiş için Ctrl+K kullanabilirsiniz.',
+            timestamp: new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit'
+            }),
             isMine: false,
             isSystem: true
           }
@@ -184,10 +458,22 @@ export default function App() {
       });
     } catch (error) {
       console.error('Bağlantı hatası:', error);
-      alert('Ağa bağlanılamadı. Arka planı kontrol edin.');
+      alert('Ağa bağlanılamadı. Arka plan servisini kontrol edin.');
     }
   };
 
+  const handleDisconnect = () => {
+    setIsLoggedIn(false);
+    setIsPaletteOpen(false);
+    setIsDragging(false);
+    setPeers([]);
+    setHistories({ [GROUP_TAB_ID]: [] });
+    setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
+    setActiveTabId(GROUP_TAB_ID);
+    setInputText('');
+  };
+
+  // --- SEKME YÖNETİMİ ---
   const handleSelectTab = (tabId: string) => {
     setActiveTabId(tabId);
     setTabs((prev) =>
@@ -200,14 +486,14 @@ export default function App() {
       const exists = prev.some((t) => t.id === peer.id);
       if (exists) {
         return prev.map((t) =>
-          t.id === peer.id ? { ...t, title: `@${peer.username}`, hasUnread: false } : t
+          t.id === peer.id ? { ...t, title: peer.username, hasUnread: false } : t
         );
       }
       return [
         ...prev,
         {
           id: peer.id,
-          title: `@${peer.username}`,
+          title: peer.username,
           isGroup: false,
           hasUnread: false
         }
@@ -218,10 +504,15 @@ export default function App() {
       ...prev,
       [peer.id]: prev[peer.id] || [
         {
+          id: crypto.randomUUID(),
           sender_id: 'SYSTEM',
-          sender_name: 'SYSTEM',
-          text: `@${peer.username} (${peer.ip}) ile uçtan uca şifreli özel kanal açıldı.`,
-          timestamp: new Date().toLocaleTimeString(),
+          sender_name: 'Sistem',
+          text: `${peer.username} (${peer.ip}) ile uçtan uca şifreli özel sohbet başlatıldı.`,
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+          }),
           isMine: false,
           isSystem: true
         }
@@ -244,19 +535,75 @@ export default function App() {
     }
   };
 
+  // --- SLASH KOMUTLARI ---
+  const runSlashCommand = (command: string, targetTab = activeTabId) => {
+    if (command === '/clear') {
+      setHistories((prev) => ({
+        ...prev,
+        [targetTab]: [
+          {
+            id: crypto.randomUUID(),
+            sender_id: 'SYSTEM',
+            sender_name: 'Sistem',
+            text: 'Sohbet geçmişi temizlendi.',
+            timestamp: new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit'
+            }),
+            isMine: false,
+            isSystem: true
+          }
+        ]
+      }));
+    } else if (command === '/help') {
+      setHistories((prev) => ({
+        ...prev,
+        [targetTab]: [
+          ...(prev[targetTab] || []),
+          {
+            id: crypto.randomUUID(),
+            sender_id: 'SYSTEM',
+            sender_name: 'Sistem',
+            text: 'Kullanılabilir Komutlar ve Kısayollar:\n• /clear — Aktif sekmedeki mesaj geçmişini temizler.\n• /help — Bu yardım menüsünü gösterir.\n• Ctrl + K — Hızlı geçiş menüsünü açar.\n• Sürükle-Bırak — Pencereye bırakılan dosyaları aktif kanala otomatik gönderir.',
+            timestamp: new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit'
+            }),
+            isMine: false,
+            isSystem: true
+          }
+        ]
+      }));
+    }
+  };
+
+  // --- MESAJ GÖNDERME ---
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim()) return;
+    const trimmed = inputText.trim();
+    if (!trimmed) return;
 
-    const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
-    const textToSend = inputText;
     setInputText('');
 
+    if (trimmed === '/clear' || trimmed === '/help') {
+      runSlashCommand(trimmed);
+      return;
+    }
+
+    const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
+
     const newMsg: ChatMessage = {
+      id: crypto.randomUUID(),
       sender_id: 'me',
       sender_name: username,
-      text: textToSend,
-      timestamp: new Date().toLocaleTimeString(),
+      text: inputText,
+      timestamp: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      }),
       isMine: true
     };
 
@@ -266,12 +613,13 @@ export default function App() {
     }));
 
     try {
-      await bridge.sendMessage(targetId, textToSend);
+      await bridge.sendMessage(targetId, inputText);
     } catch (err) {
       console.error('Mesaj gönderilemedi:', err);
     }
   };
 
+  // --- ATAÇ İLE DOSYA GÖNDERME ---
   const handleAttachFile = async () => {
     try {
       const selected = await open({
@@ -280,101 +628,285 @@ export default function App() {
       });
 
       if (!selected || typeof selected !== 'string') return;
-
-      const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
-      const fileName = selected.split(/[/\\]/).pop() || selected;
-
-      await bridge.sendFile(targetId, selected);
-
-      const fileMsg: ChatMessage = {
-        sender_id: 'me',
-        sender_name: username,
-        text: `[DOSYA GÖNDERİLDİ]: ${fileName}`,
-        timestamp: new Date().toLocaleTimeString(),
-        isMine: true
-      };
-
-      setHistories((prev) => ({
-        ...prev,
-        [activeTabId]: [...(prev[activeTabId] || []), fileMsg]
-      }));
+      await dispatchFileToTarget(selected);
     } catch (err) {
       console.error('Dosya seçme veya gönderme hatası:', err);
     }
   };
 
+  // --- EKRAN 1: MODERN GİRİŞ EKRANI ---
   if (!isLoggedIn) {
     return (
-      <div className="flex items-center justify-center h-screen w-screen bg-[#050505] text-[#00ff41] font-mono">
-        <div className="w-full max-w-md p-8 bg-[#0a0a0a] border border-[#00ff41]/40 rounded shadow-[0_0_30px_rgba(0,255,65,0.15)] relative overflow-hidden">
-          <div className="absolute top-0 left-0 w-full h-[2px] bg-[#00ff41] opacity-50 shadow-[0_0_10px_#00ff41] animate-[scan_2s_ease-in-out_infinite]"></div>
+      <div className="flex items-center justify-center h-screen w-screen bg-[#09090b] text-zinc-100 font-sans relative overflow-hidden">
+        <div className="absolute w-[500px] h-[500px] bg-emerald-500/10 rounded-full blur-[120px] pointer-events-none" />
 
-          <div className="flex flex-col items-center mb-8">
-            <Terminal className="w-12 h-12 mb-4 animate-pulse drop-shadow-[0_0_10px_rgba(0,255,65,0.8)]" />
-            <h1 className="text-3xl font-bold tracking-widest drop-shadow-[0_0_5px_rgba(0,255,65,0.5)] uppercase">LabChat_v1</h1>
-            <p className="text-xs text-[#00ff41]/60 mt-2">SECURE P2P PROTOCOL</p>
+        <div className="w-full max-w-md p-8 bg-zinc-900/80 backdrop-blur-xl border border-zinc-800/90 rounded-2xl shadow-2xl relative z-10">
+          <div className="flex flex-col items-center text-center mb-8">
+            <div className="w-12 h-12 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mb-4 shadow-inner">
+              <Shield className="w-6 h-6 text-emerald-400" />
+            </div>
+            <h1 className="text-2xl font-semibold tracking-tight text-white">LabChat</h1>
+            <p className="text-sm text-zinc-400 mt-1">Uçtan uca şifreli yerel P2P iletişim ağı</p>
           </div>
 
-          <form onSubmit={handleLogin} className="space-y-6">
-            <div className="space-y-2">
-              <label className="text-xs flex items-center gap-2 text-[#00ff41]/80"><Wifi className="w-3 h-3" /> IDENTIFIER</label>
+          <form onSubmit={handleLogin} className="space-y-5">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-400 flex items-center gap-1.5">
+                <Wifi className="w-3.5 h-3.5 text-zinc-500" /> Kullanıcı Adı
+              </label>
               <input
                 type="text"
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                className="w-full bg-black border border-[#00ff41]/30 p-3 text-[#00ff41] focus:outline-none focus:border-[#00ff41] focus:shadow-[0_0_10px_rgba(0,255,65,0.2)] transition-all"
-                placeholder="Örn: zero_day"
+                className="w-full bg-zinc-950/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500/60 focus:ring-2 focus:ring-emerald-500/15 transition-all"
+                placeholder="Örn: egehan"
                 required
               />
             </div>
-            <div className="space-y-2">
-              <label className="text-xs flex items-center gap-2 text-[#00ff41]/80"><Key className="w-3 h-3" /> NETWORK KEY</label>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-zinc-400 flex items-center gap-1.5">
+                <Key className="w-3.5 h-3.5 text-zinc-500" /> Oda Parolası
+              </label>
               <input
                 type="password"
                 value={roomPassword}
                 onChange={(e) => setRoomPassword(e.target.value)}
-                className="w-full bg-black border border-[#00ff41]/30 p-3 text-[#00ff41] focus:outline-none focus:border-[#00ff41] focus:shadow-[0_0_10px_rgba(0,255,65,0.2)] transition-all tracking-widest"
+                className="w-full bg-zinc-950/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-emerald-500/60 focus:ring-2 focus:ring-emerald-500/15 transition-all tracking-widest"
                 placeholder="••••••••"
                 required
               />
             </div>
+
             <button
               type="submit"
-              className="w-full py-4 bg-[#00ff41]/10 border border-[#00ff41] text-[#00ff41] font-bold tracking-widest hover:bg-[#00ff41] hover:text-black hover:shadow-[0_0_20px_rgba(0,255,65,0.6)] transition-all flex justify-center items-center gap-3"
+              className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold text-sm rounded-xl shadow-lg shadow-emerald-500/15 transition-all flex justify-center items-center gap-2 mt-2"
             >
-              <ShieldAlert className="w-5 h-5" /> AĞA KATIL
+              Ağa Bağlan
             </button>
           </form>
         </div>
-        <style>{`@keyframes scan { 0% { top: -10px; } 50% { top: 100%; } 100% { top: -10px; } }`}</style>
       </div>
     );
   }
 
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
   const currentMessages = histories[activeTabId] || [];
+  const activePeer = peers.find((p) => p.id === activeTabId);
 
+  // --- CTRL + K HIZLI GEÇİŞ ÖĞELERİ ---
+  const quickItems: QuickActionItem[] = [
+    ...tabs.map((t) => ({
+      id: `tab-${t.id}`,
+      label: t.isGroup ? '# BROADCAST_ALL' : `@${t.title}`,
+      sublabel: t.isGroup ? 'Grup Kanalına Geç' : 'Açık Özel Sohbet Sekmesi',
+      category: 'Sekmeler' as const,
+      onSelect: () => handleSelectTab(t.id)
+    })),
+    ...peers.map((p) => ({
+      id: `peer-${p.id}`,
+      label: `@${p.username}`,
+      sublabel: `Özel mesaj başlat • ${p.ip}`,
+      category: 'Cihazlar' as const,
+      onSelect: () => handleOpenDmTab(p)
+    })),
+    {
+      id: 'cmd-attach',
+      label: 'Dosya Gönder...',
+      sublabel: 'Aktif kanala dosya seçip gönder',
+      category: 'Komutlar',
+      onSelect: () => handleAttachFile()
+    },
+    {
+      id: 'cmd-clear',
+      label: '/clear — Sohbeti Temizle',
+      sublabel: 'Aktif sekmedeki geçmişi sıfırla',
+      category: 'Komutlar',
+      onSelect: () => runSlashCommand('/clear')
+    },
+    {
+      id: 'cmd-help',
+      label: '/help — Yardım Menüsü',
+      sublabel: 'Komut ve kısayol listesini göster',
+      category: 'Komutlar',
+      onSelect: () => runSlashCommand('/help')
+    },
+    {
+      id: 'cmd-disconnect',
+      label: 'Disconnect — Oturumu Kapat',
+      sublabel: 'Ağ bağlantısını sonlandır ve giriş ekranına dön',
+      category: 'Komutlar',
+      onSelect: () => handleDisconnect()
+    }
+  ];
+
+  const filteredQuickItems = quickItems.filter(
+    (item) =>
+      item.label.toLowerCase().includes(paletteQuery.toLowerCase()) ||
+      item.sublabel.toLowerCase().includes(paletteQuery.toLowerCase())
+  );
+
+  const handlePaletteKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (filteredQuickItems.length === 0) return;
+
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev + 1) % filteredQuickItems.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setSelectedIndex((prev) => (prev - 1 + filteredQuickItems.length) % filteredQuickItems.length);
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const target = filteredQuickItems[selectedIndex];
+      if (target) {
+        target.onSelect();
+        setIsPaletteOpen(false);
+      }
+    }
+  };
+
+  // --- EKRAN 2: MODERN SEKMELİ SOHBET ARAYÜZÜ ---
   return (
-    <div className="flex h-screen w-screen bg-[#050505] text-[#00ff41] font-mono">
-      {/* SOL PANEL - NODE_LIST */}
-      <div className="w-72 border-r border-[#00ff41]/30 bg-[#0a0a0a] flex flex-col z-10">
-        <div className="p-5 border-b border-[#00ff41]/30 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <Terminal className="text-[#00ff41] w-5 h-5" />
-            <h1 className="text-lg font-bold tracking-widest uppercase">LabChat</h1>
+    <div className="flex h-screen w-screen bg-[#09090b] text-zinc-100 font-sans select-none relative">
+      {/* SÜRÜKLE-BIRAK OVERLAY */}
+      {isDragging && (
+        <div className="fixed inset-0 z-50 bg-zinc-950/80 backdrop-blur-md flex items-center justify-center p-8 pointer-events-none">
+          <div className="w-full max-w-lg p-10 rounded-3xl border-2 border-dashed border-emerald-500/70 bg-zinc-900/90 flex flex-col items-center text-center shadow-2xl">
+            <div className="w-14 h-14 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mb-4">
+              <UploadCloud className="w-7 h-7 text-emerald-400 animate-bounce" />
+            </div>
+            <h2 className="text-lg font-semibold text-white">Dosyayı Göndermek İçin Bırakın</h2>
+            <p className="text-sm text-zinc-400 mt-1">
+              Hedef Kanal:{' '}
+              <span className="text-emerald-400 font-medium">
+                {activeTab.isGroup ? '# BROADCAST_ALL' : `@${activeTab.title}`}
+              </span>
+            </p>
           </div>
-          <div className="w-2 h-2 rounded-full bg-[#00ff41] animate-ping"></div>
+        </div>
+      )}
+
+      {/* CTRL + K HIZLI GEÇİŞ KOMUT PALETİ */}
+      {isPaletteOpen && (
+        <div
+          onClick={() => setIsPaletteOpen(false)}
+          className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm flex items-start justify-center pt-[14vh] px-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+          >
+            <div className="flex items-center gap-3 px-4 py-3.5 border-b border-zinc-800">
+              <Search className="w-4 h-4 text-zinc-400 shrink-0" />
+              <input
+                ref={paletteInputRef}
+                type="text"
+                value={paletteQuery}
+                onChange={(e) => {
+                  setPaletteQuery(e.target.value);
+                  setSelectedIndex(0);
+                }}
+                onKeyDown={handlePaletteKeyDown}
+                placeholder="Cihaz, sekme veya komut ara..."
+                className="flex-1 bg-transparent text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none"
+              />
+              <span className="text-[10px] font-mono text-zinc-500 bg-zinc-800 px-1.5 py-0.5 rounded">
+                ESC
+              </span>
+            </div>
+
+            <div className="max-h-72 overflow-y-auto p-2 space-y-1">
+              {filteredQuickItems.length === 0 ? (
+                <div className="py-8 text-center text-xs text-zinc-500">
+                  Eşleşen sonuç bulunamadı
+                </div>
+              ) : (
+                filteredQuickItems.map((item, idx) => {
+                  const isSelected = idx === selectedIndex;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onMouseEnter={() => setSelectedIndex(idx)}
+                      onClick={() => {
+                        item.onSelect();
+                        setIsPaletteOpen(false);
+                      }}
+                      className={`w-full text-left px-3.5 py-2.5 rounded-xl flex items-center justify-between transition-colors ${
+                        isSelected
+                          ? 'bg-emerald-500/15 text-white border border-emerald-500/30'
+                          : 'text-zinc-300 hover:bg-zinc-800/70 border border-transparent'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate">{item.label}</div>
+                        <div className="text-[11px] text-zinc-500 truncate">{item.sublabel}</div>
+                      </div>
+                      <span className="text-[10px] font-medium text-zinc-400 bg-zinc-800/90 px-2 py-0.5 rounded-md shrink-0 ml-2">
+                        {item.category}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* SOL KENAR ÇUBUĞU (SIDEBAR) */}
+      <aside className="w-72 border-r border-zinc-800/80 bg-[#0c0c0f] flex flex-col">
+        <div className="h-14 px-5 border-b border-zinc-800/80 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-7 h-7 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center">
+              <Shield className="w-4 h-4 text-emerald-400" />
+            </div>
+            <span className="font-semibold tracking-tight text-zinc-100">LabChat</span>
+          </div>
+          <span className="inline-flex items-center gap-1.5 text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            Aktif
+          </span>
         </div>
 
-        <div className="p-4 flex-1 overflow-y-auto">
-          <div className="flex items-center gap-2 mb-4 text-[#00ff41]/70 text-xs border-b border-[#00ff41]/20 pb-2 uppercase tracking-wider">
-            <Users className="w-4 h-4" />
-            <span>NODE_LIST ({peers.length})</span>
+        {/* Hızlı Arama Butonu */}
+        <div className="px-3.5 pt-3.5">
+          <button
+            type="button"
+            onClick={() => {
+              setIsPaletteOpen(true);
+              setPaletteQuery('');
+              setSelectedIndex(0);
+            }}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-zinc-900/90 hover:bg-zinc-800/90 border border-zinc-800 text-xs text-zinc-400 transition-colors"
+          >
+            <span className="flex items-center gap-2">
+              <Search className="w-3.5 h-3.5 text-zinc-500" />
+              Hızlı Geçiş...
+            </span>
+            <span className="inline-flex items-center gap-0.5 text-[10px] font-mono text-zinc-500 bg-zinc-950 px-1.5 py-0.5 rounded border border-zinc-800">
+              <Command className="w-2.5 h-2.5" />K
+            </span>
+          </button>
+        </div>
+
+        {/* Çevrimiçi Düğümler Listesi */}
+        <div className="p-3.5 flex-1 overflow-y-auto">
+          <div className="flex items-center justify-between px-2 mb-3 text-xs font-medium text-zinc-400">
+            <span className="flex items-center gap-1.5">
+              <Users className="w-3.5 h-3.5 text-zinc-500" />
+              Ağdaki Cihazlar
+            </span>
+            <span className="text-[11px] bg-zinc-800/80 text-zinc-300 px-2 py-0.5 rounded-md font-mono">
+              {peers.length}
+            </span>
           </div>
 
-          <ul className="space-y-3">
+          <ul className="space-y-1.5">
             {peers.length === 0 && (
-              <li className="text-xs text-[#00ff41]/40 italic">Ağda kimse yok...</li>
+              <li className="px-3 py-6 text-center text-xs text-zinc-500 bg-zinc-900/40 rounded-xl border border-zinc-800/50">
+                Ağda başka cihaz bulunamadı
+              </li>
             )}
             {peers.map((peer) => {
               const isSelectedDm = activeTabId === peer.id;
@@ -382,63 +914,69 @@ export default function App() {
                 <li
                   key={peer.id}
                   onClick={() => handleOpenDmTab(peer)}
-                  title="Özel mesaj (DM) başlat"
-                  className={`p-3 border transition-all cursor-pointer group ${
+                  className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between group ${
                     isSelectedDm
-                      ? 'border-[#00ff41] bg-[#00ff41]/15 shadow-[0_0_12px_rgba(0,255,65,0.2)]'
-                      : 'border-[#00ff41]/20 bg-black hover:bg-[#00ff41]/10 hover:border-[#00ff41]/50'
+                      ? 'bg-zinc-800/90 border-zinc-700 text-white shadow-sm'
+                      : 'bg-transparent border-transparent hover:bg-zinc-900/90 hover:border-zinc-800/80 text-zinc-300'
                   }`}
                 >
-                  <div className="flex justify-between items-center">
-                    <span className="font-bold text-[#00ff41] group-hover:drop-shadow-[0_0_5px_rgba(0,255,65,0.8)]">
-                      @{peer.username}
-                    </span>
-                    <span className="w-1.5 h-1.5 rounded-full bg-[#00ff41] shadow-[0_0_5px_#00ff41]"></span>
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="relative shrink-0">
+                      <div className="w-8 h-8 rounded-lg bg-zinc-800 border border-zinc-700/80 flex items-center justify-center text-xs font-semibold text-zinc-200 uppercase">
+                        {peer.username.slice(0, 2)}
+                      </div>
+                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-[#0c0c0f]" />
+                    </div>
+                    <div className="truncate">
+                      <div className="text-sm font-medium truncate">{peer.username}</div>
+                      <div className="text-[11px] text-zinc-500 font-mono truncate">{peer.ip}</div>
+                    </div>
                   </div>
-                  <div className="text-[10px] text-[#00ff41]/50 mt-1 flex items-center justify-between">
-                    <span>{peer.ip}</span>
-                    <span className="opacity-0 group-hover:opacity-100 text-[#00ff41] transition-opacity">
-                      [DM]
-                    </span>
-                  </div>
+                  <span className="text-[10px] font-medium text-zinc-400 opacity-0 group-hover:opacity-100 bg-zinc-800 px-2 py-0.5 rounded-md transition-opacity">
+                    DM
+                  </span>
                 </li>
               );
             })}
           </ul>
         </div>
 
-        <div className="p-4 text-[10px] border-t border-[#00ff41]/30 text-[#00ff41]/50 flex items-center justify-between bg-black">
-          <span className="tracking-widest">ENCRYPTION: ENABLED</span>
-          <Lock className="w-3 h-3 text-[#00ff41]" />
+        <div className="p-3.5 border-t border-zinc-800/80 bg-zinc-950/40 flex items-center justify-between text-xs text-zinc-500">
+          <span className="flex items-center gap-1.5">
+            <Lock className="w-3.5 h-3.5 text-emerald-500/80" />
+            E2E Şifreleme Aktif
+          </span>
+          <span className="font-mono text-[11px] text-zinc-600">P2P</span>
         </div>
-      </div>
+      </aside>
 
-      {/* SAĞ PANEL - SEKMELER VE MESAJLAŞMA */}
-      <div className="flex-1 flex flex-col relative bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#0a0a0a] to-[#050505]">
-        <div className="flex items-center bg-[#070707] border-b border-[#00ff41]/30 px-2 pt-2 gap-1 overflow-x-auto">
+      {/* SAĞ ANA ALAN */}
+      <main className="flex-1 flex flex-col bg-[#09090b] min-w-0">
+        {/* Üst Sekme Çubuğu (Tab Bar) */}
+        <div className="h-11 bg-[#0c0c0f] border-b border-zinc-800/80 px-3 flex items-center gap-1.5 overflow-x-auto">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
             return (
               <div
                 key={tab.id}
                 onClick={() => handleSelectTab(tab.id)}
-                className={`flex items-center gap-2 px-4 py-2 text-xs cursor-pointer border-t border-x transition-all select-none shrink-0 ${
+                className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium cursor-pointer transition-all shrink-0 ${
                   isActive
-                    ? 'bg-[#0a0a0a] border-[#00ff41]/60 text-[#00ff41] font-bold shadow-[0_-2px_10px_rgba(0,255,65,0.1)]'
-                    : 'bg-black/60 border-[#00ff41]/15 text-[#00ff41]/50 hover:text-[#00ff41]/80 hover:border-[#00ff41]/30'
+                    ? 'bg-zinc-800 text-white shadow-sm border border-zinc-700/70'
+                    : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-900/80 border border-transparent'
                 }`}
               >
                 {tab.isGroup ? (
-                  <Hash className="w-3.5 h-3.5 text-[#00ff41]" />
+                  <Hash className={`w-3.5 h-3.5 ${isActive ? 'text-emerald-400' : 'text-zinc-500'}`} />
                 ) : (
-                  <MessageSquare className="w-3.5 h-3.5 text-[#00ff41]" />
+                  <MessageSquare className={`w-3.5 h-3.5 ${isActive ? 'text-emerald-400' : 'text-zinc-500'}`} />
                 )}
                 <span>{tab.isGroup ? 'BROADCAST_ALL' : tab.title}</span>
 
                 {tab.hasUnread && !isActive && (
                   <span
-                    title="Yeni mesaj/dosya"
-                    className="w-2 h-2 rounded-full bg-[#00ff41] animate-pulse shadow-[0_0_8px_#00ff41]"
+                    title="Okunmamış mesaj"
+                    className="w-2 h-2 rounded-full bg-emerald-400"
                   />
                 )}
 
@@ -446,7 +984,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={(e) => handleCloseTab(e, tab.id)}
-                    className="ml-1 p-0.5 text-[#00ff41]/50 hover:text-black hover:bg-[#00ff41] rounded-sm transition-colors"
+                    className="ml-1 p-0.5 text-zinc-500 hover:text-zinc-100 hover:bg-zinc-700 rounded transition-colors"
                     title="Sekmeyi Kapat"
                   >
                     <X className="w-3 h-3" />
@@ -457,61 +995,187 @@ export default function App() {
           })}
         </div>
 
-        <div className="h-14 border-b border-[#00ff41]/30 flex items-center px-6 bg-[#0a0a0a]/80 justify-between">
-          <div>
-            <div className="font-bold text-sm tracking-wider drop-shadow-[0_0_5px_rgba(0,255,65,0.3)]">
-              {'>'} TARGET: {activeTab.isGroup ? 'BROADCAST_ALL (GROUP)' : `${activeTab.title} (DIRECT_MESSAGE)`}
-            </div>
-            <div className="text-[10px] text-[#00ff41]/40 uppercase tracking-widest mt-0.5">
-              {activeTab.isGroup ? 'P2P MESH BROADCAST CHANNEL' : 'PRIVATE E2E ENCRYPTED SESSION'}
+        {/* Üst Durum ve Oturum Barı */}
+        <header className="h-14 border-b border-zinc-800/80 px-6 bg-zinc-950/60 backdrop-blur-md flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-zinc-100 truncate">
+                {activeTab.isGroup ? '# BROADCAST_ALL' : `@${activeTab.title}`}
+              </span>
+              <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-zinc-900 border border-zinc-800 text-zinc-400">
+                {activeTab.isGroup ? 'Grup Ağı' : activePeer ? activePeer.ip : 'Özel Mesaj'}
+              </span>
             </div>
           </div>
-          <div className="text-xs text-[#00ff41]/60 bg-[#00ff41]/10 px-3 py-1 border border-[#00ff41]/30">
-            USER: {username}
-          </div>
-        </div>
 
-        <div className="flex-1 overflow-y-auto p-6 space-y-5">
+          <div className="flex items-center gap-2.5 shrink-0">
+            <div
+              title="Aktif oturum süresi"
+              className="flex items-center gap-1.5 text-xs font-mono text-zinc-400 bg-zinc-900/90 border border-zinc-800 px-2.5 py-1.5 rounded-lg"
+            >
+              <Clock className="w-3.5 h-3.5 text-emerald-400" />
+              <span>{formatUptime(uptimeSeconds)}</span>
+            </div>
+
+            <div className="text-xs font-medium text-zinc-300 bg-zinc-900/90 border border-zinc-800 px-3 py-1.5 rounded-lg">
+              {username}
+            </div>
+
+            <button
+              type="button"
+              onClick={handleDisconnect}
+              title="Oturumu Kapat ve Çık"
+              className="flex items-center gap-1.5 text-xs font-medium text-rose-400 hover:text-rose-300 bg-rose-500/10 hover:bg-rose-500/15 border border-rose-500/20 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Disconnect</span>
+            </button>
+          </div>
+        </header>
+
+        {/* Mesaj ve Dosya Akışı */}
+        <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4 select-text">
           {currentMessages.length === 0 && (
-            <div className="text-xs text-[#00ff41]/30 italic text-center mt-10">
-              Bu kanalda henüz mesaj yok. İletişim başlatmak için aşağıdan veri gönderin.
+            <div className="h-full flex flex-col items-center justify-center text-center text-zinc-500">
+              <p className="text-sm">Henüz mesaj yok</p>
+              <p className="text-xs text-zinc-600 mt-1">
+                Mesaj yazabilir veya dosya sürükleyip bırakabilirsiniz
+              </p>
             </div>
           )}
-          {currentMessages.map((msg, idx) => (
-            <div key={idx} className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}>
-              <div className="text-[10px] text-[#00ff41]/50 mb-1 flex gap-2 tracking-widest">
-                {!msg.isMine && (
-                  <span className="font-bold text-[#00ff41]/80">
-                    {msg.isSystem ? '[SYSTEM]' : `@${msg.sender_name}`}
-                  </span>
-                )}
-                <span>[{msg.timestamp}]</span>
-              </div>
+
+          {currentMessages.map((msg) => {
+            if (msg.isSystem) {
+              return (
+                <div key={msg.id} className="flex justify-center my-2">
+                  <div className="px-3.5 py-1.5 rounded-xl bg-zinc-900/80 border border-zinc-800/80 text-xs text-zinc-400 max-w-xl whitespace-pre-wrap">
+                    {msg.text}
+                  </div>
+                </div>
+              );
+            }
+
+            const hasCode = !msg.file && isCodeMessage(msg.text);
+
+            return (
               <div
-                className={`px-4 py-2.5 max-w-[75%] border break-all text-sm leading-relaxed ${
-                  msg.isMine
-                    ? 'bg-[#00ff41]/10 border-[#00ff41]/50 text-[#00ff41] shadow-[0_0_15px_rgba(0,255,65,0.1)]'
-                    : msg.isSystem
-                      ? 'bg-transparent border-dashed border-[#00ff41]/30 text-[#00ff41]/70'
-                      : 'bg-black border-[#00ff41]/30 text-[#00ff41]/90'
-                }`}
+                key={msg.id}
+                className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}
               >
-                {msg.text}
+                <div className="flex items-center gap-2 mb-1 px-1 text-[11px] text-zinc-500">
+                  {!msg.isMine && (
+                    <span className="font-medium text-zinc-300">{msg.sender_name}</span>
+                  )}
+                  <span className="font-mono">{msg.timestamp}</span>
+                </div>
+
+                {msg.file ? (
+                  <div
+                    className={`w-full max-w-sm p-3.5 rounded-2xl border transition-all ${
+                      msg.isMine
+                        ? 'bg-emerald-500/10 border-emerald-500/25'
+                        : 'bg-zinc-900/90 border-zinc-800'
+                    }`}
+                  >
+                    <div className="flex items-start gap-3">
+                      <div
+                        className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                          msg.isMine
+                            ? 'bg-emerald-500/20 text-emerald-400'
+                            : 'bg-zinc-800 text-zinc-300'
+                        }`}
+                      >
+                        <FileText className="w-5 h-5" />
+                      </div>
+
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 text-[11px] font-medium mb-0.5">
+                          {msg.file.direction === 'sent' ? (
+                            <span className="text-emerald-400 flex items-center gap-0.5">
+                              <ArrowUpRight className="w-3 h-3" /> Dosya Gönderildi
+                            </span>
+                          ) : (
+                            <span className="text-sky-400 flex items-center gap-0.5">
+                              <ArrowDownLeft className="w-3 h-3" /> Dosya Alındı
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-sm font-medium text-zinc-100 truncate" title={msg.file.fileName}>
+                          {msg.file.fileName}
+                        </div>
+                        <div className="text-[11px] font-mono text-zinc-500 truncate mt-1" title={msg.file.filePath}>
+                          {msg.file.filePath}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(msg.id, msg.file!.filePath)}
+                        title="Dosya yolunu kopyala"
+                        className="p-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors shrink-0"
+                      >
+                        {copiedId === msg.id ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    className={`group relative max-w-[75%] rounded-2xl border transition-all ${
+                      hasCode
+                        ? 'bg-zinc-950 border-zinc-800 p-0 overflow-hidden'
+                        : msg.isMine
+                          ? 'bg-emerald-500/15 border-emerald-500/25 text-zinc-100 px-4 py-2.5'
+                          : 'bg-zinc-900 border-zinc-800/90 text-zinc-200 px-4 py-2.5'
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(msg.id, hasCode ? cleanCodeContent(msg.text) : msg.text)}
+                      title="Metni kopyala"
+                      className="absolute top-2 right-2 p-1.5 rounded-lg bg-zinc-800/90 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity border border-zinc-700/60"
+                    >
+                      {copiedId === msg.id ? (
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+
+                    {hasCode ? (
+                      <div>
+                        <div className="px-3.5 py-1.5 bg-zinc-900/90 border-b border-zinc-800 flex items-center gap-1.5 text-[11px] font-mono text-zinc-400">
+                          <Terminal className="w-3 h-3 text-emerald-400" />
+                          <span>snippet</span>
+                        </div>
+                        <pre className="p-3.5 pr-10 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed overflow-x-auto">
+                          {cleanCodeContent(msg.text)}
+                        </pre>
+                      </div>
+                    ) : (
+                      <p className="text-sm leading-relaxed break-words pr-6">{msg.text}</p>
+                    )}
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
           <div ref={messagesEndRef} />
         </div>
 
-        <div className="p-5 bg-[#0a0a0a] border-t border-[#00ff41]/30">
-          <form onSubmit={handleSendMessage} className="flex gap-4 items-center">
+        {/* Alt Mesaj Gönderme Çubuğu */}
+        <div className="p-4 bg-[#0c0c0f] border-t border-zinc-800/80">
+          <form onSubmit={handleSendMessage} className="flex items-center gap-3">
             <button
               type="button"
               onClick={handleAttachFile}
-              title="Dosya Seç ve Gönder"
-              className="p-3 bg-black border border-[#00ff41]/30 text-[#00ff41] hover:bg-[#00ff41]/20 hover:border-[#00ff41] transition-all group"
+              title="Dosya Gönder"
+              className="p-3 rounded-xl bg-zinc-900 hover:bg-zinc-800 border border-zinc-800 text-zinc-400 hover:text-zinc-100 transition-colors shrink-0"
             >
-              <Paperclip className="w-5 h-5 group-hover:drop-shadow-[0_0_5px_rgba(0,255,65,1)]" />
+              <Paperclip className="w-4 h-4" />
             </button>
 
             <input
@@ -520,22 +1184,22 @@ export default function App() {
               onChange={(e) => setInputText(e.target.value)}
               placeholder={
                 activeTab.isGroup
-                  ? '> Gruba payload girin...'
-                  : `> ${activeTab.title} kullanıcısına özel mesaj...`
+                  ? 'Gruba mesaj yazın, dosya sürükleyin veya /help deneyin...'
+                  : `@${activeTab.title} kullanıcısına özel mesaj yazın...`
               }
-              className="flex-1 bg-black border border-[#00ff41]/30 p-3 text-[#00ff41] placeholder-[#00ff41]/30 focus:outline-none focus:border-[#00ff41] focus:shadow-[0_0_10px_rgba(0,255,65,0.2)] transition-all font-mono"
+              className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/10 transition-all"
             />
 
             <button
               type="submit"
-              className="px-8 py-3 bg-[#00ff41] text-black font-bold flex items-center gap-2 hover:bg-[#33ff66] hover:shadow-[0_0_20px_rgba(0,255,65,0.5)] transition-all"
+              className="px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold text-sm flex items-center gap-2 shadow-lg shadow-emerald-500/10 transition-all shrink-0"
             >
               <Send className="w-4 h-4" />
-              <span className="tracking-widest">İLET</span>
+              <span>Gönder</span>
             </button>
           </form>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
