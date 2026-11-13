@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { bridge, Peer } from './services/bridge';
 
 interface ChatTab {
-  id: string; // 'group' veya peer.id
+  id: string;
   title: string;
   isGroup: boolean;
   hasUnread: boolean;
@@ -65,7 +65,6 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [histories, activeTabId]);
 
-  // --- EVENT LİSTENER KURULUMU ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -79,7 +78,6 @@ export default function App() {
       isPrivate: boolean,
       newMsg: ChatMessage
     ) => {
-      // Sekme kapalıysa (özellikle gelen DM'lerde) otomatik sekme aç ve okunmamış durumunu ayarla
       setTabs((prevTabs) => {
         const exists = prevTabs.some((t) => t.id === targetTabId);
         const isCurrentlyActive = activeTabRef.current === targetTabId;
@@ -103,7 +101,6 @@ export default function App() {
         );
       });
 
-      // İlgili sekmenin geçmişine mesajı ekle
       setHistories((prev) => ({
         ...prev,
         [targetTabId]: [...(prev[targetTabId] || []), newMsg]
@@ -114,7 +111,6 @@ export default function App() {
       try {
         unlistenPeers = await bridge.onPeersUpdated((updatedPeers) => {
           setPeers(updatedPeers);
-          // Açık DM sekmelerindeki kullanıcı adları güncellendiyse senkronize tut
           setTabs((prevTabs) =>
             prevTabs.map((tab) => {
               if (tab.isGroup) return tab;
@@ -167,7 +163,6 @@ export default function App() {
     };
   }, [isLoggedIn]);
 
-  // --- GİRİŞ İŞLEMİ ---
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
     if (!username.trim() || !roomPassword.trim()) return;
@@ -193,7 +188,6 @@ export default function App() {
     }
   };
 
-  // --- SEKME YÖNETİMİ ---
   const handleSelectTab = (tabId: string) => {
     setActiveTabId(tabId);
     setTabs((prev) =>
@@ -250,7 +244,6 @@ export default function App() {
     }
   };
 
-  // --- MESAJ GÖNDERME ---
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
     if (!inputText.trim()) return;
@@ -279,7 +272,6 @@ export default function App() {
     }
   };
 
-  // --- ATAÇ İLE DOSYA GÖNDERME ---
   const handleAttachFile = async () => {
     try {
       const selected = await open({
@@ -311,7 +303,6 @@ export default function App() {
     }
   };
 
-  // --- EKRAN 1: GİRİŞ EKRANI ---
   if (!isLoggedIn) {
     return (
       <div className="flex items-center justify-center h-screen w-screen bg-[#050505] text-[#00ff41] font-mono">
@@ -363,7 +354,6 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
   const currentMessages = histories[activeTabId] || [];
 
-  // --- EKRAN 2: SEKMELİ SOHBET ARAYÜZÜ ---
   return (
     <div className="flex h-screen w-screen bg-[#050505] text-[#00ff41] font-mono">
       {/* SOL PANEL - NODE_LIST */}
@@ -425,7 +415,6 @@ export default function App() {
 
       {/* SAĞ PANEL - SEKMELER VE MESAJLAŞMA */}
       <div className="flex-1 flex flex-col relative bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-[#0a0a0a] to-[#050505]">
-        {/* Üst Sekme Çubuğu (Tab Bar) */}
         <div className="flex items-center bg-[#070707] border-b border-[#00ff41]/30 px-2 pt-2 gap-1 overflow-x-auto">
           {tabs.map((tab) => {
             const isActive = tab.id === activeTabId;
@@ -446,7 +435,6 @@ export default function App() {
                 )}
                 <span>{tab.isGroup ? 'BROADCAST_ALL' : tab.title}</span>
 
-                {/* Okunmamış Bildirim Noktası */}
                 {tab.hasUnread && !isActive && (
                   <span
                     title="Yeni mesaj/dosya"
@@ -454,7 +442,6 @@ export default function App() {
                   />
                 )}
 
-                {/* DM Sekmesi Kapatma Butonu */}
                 {!tab.isGroup && (
                   <button
                     type="button"
@@ -470,7 +457,6 @@ export default function App() {
           })}
         </div>
 
-        {/* Aktif Kanal Bilgi Barı */}
         <div className="h-14 border-b border-[#00ff41]/30 flex items-center px-6 bg-[#0a0a0a]/80 justify-between">
           <div>
             <div className="font-bold text-sm tracking-wider drop-shadow-[0_0_5px_rgba(0,255,65,0.3)]">
@@ -485,7 +471,6 @@ export default function App() {
           </div>
         </div>
 
-        {/* Mesaj Akışı */}
         <div className="flex-1 overflow-y-auto p-6 space-y-5">
           {currentMessages.length === 0 && (
             <div className="text-xs text-[#00ff41]/30 italic text-center mt-10">
@@ -518,7 +503,6 @@ export default function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Girdi Alanı */}
         <div className="p-5 bg-[#0a0a0a] border-t border-[#00ff41]/30">
           <form onSubmit={handleSendMessage} className="flex gap-4 items-center">
             <button
