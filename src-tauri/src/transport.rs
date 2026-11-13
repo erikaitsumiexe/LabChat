@@ -5,7 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_notification::NotificationExt;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -79,7 +80,7 @@ pub struct MessageRead {
 #[derive(Clone, Serialize)]
 pub struct MessageStatus {
     pub msg_id: String,
-    pub status: String, // "queued" | "sent"
+    pub status: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -89,9 +90,30 @@ pub struct OutboxItem {
     pub sender_id: String,
     pub sender_name: String,
     pub timestamp: String,
-    pub kind: String, // "text" | "file"
+    pub kind: String,
     pub text: Option<String>,
     pub file_path: Option<String>,
+}
+
+fn send_desktop_notification(app: &AppHandle, title: &str, body: &str) {
+    let should_notify = match app.get_webview_window("main") {
+        Some(win) => {
+            let visible = win.is_visible().unwrap_or(false);
+            let focused = win.is_focused().unwrap_or(false);
+            !visible || !focused
+        }
+        None => true,
+    };
+
+    if should_notify {
+        let preview: String = body.chars().take(100).collect();
+        let _ = app
+            .notification()
+            .builder()
+            .title(title)
+            .body(&preview)
+            .show();
+    }
 }
 
 fn outbox_file_path() -> PathBuf {
@@ -170,7 +192,6 @@ pub async fn flush_outbox_for_peer(
                     is_private: true,
                 })
             } else {
-                // Kaynak dosya silinmişse kuyruktan düşür
                 delivered_ids.push(item.msg_id.clone());
                 None
             }
@@ -276,6 +297,13 @@ pub async fn start_tcp_server(
                                                 p_map.get(&sender_id).map(|p| p.ip.clone())
                                             };
 
+                                            let title = if is_private {
+                                                format!("{} (Özel Mesaj)", sender_name)
+                                            } else {
+                                                format!("{} (#Genel)", sender_name)
+                                            };
+                                            send_desktop_notification(&app_clone, &title, &text);
+
                                             let ui_msg = ReceivedMessage {
                                                 msg_id: msg_id.clone(),
                                                 sender_id,
@@ -310,6 +338,13 @@ pub async fn start_tcp_server(
                                                     let p_map = peers_clone.lock().await;
                                                     p_map.get(&sender_id).map(|p| p.ip.clone())
                                                 };
+
+                                                let title = if is_private {
+                                                    format!("{} - Dosya Gönderdi", sender_name)
+                                                } else {
+                                                    format!("{} (#Genel) - Dosya", sender_name)
+                                                };
+                                                send_desktop_notification(&app_clone, &title, &file_name);
 
                                                 let ui_file = ReceivedFile {
                                                     msg_id: msg_id.clone(),
