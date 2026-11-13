@@ -20,12 +20,18 @@ import {
   Terminal,
   Search,
   UploadCloud,
-  Command
+  Command,
+  Eye,
+  ZoomIn,
+  ZoomOut,
+  Loader2,
+  AlertCircle,
+  Image as ImageIcon
 } from 'lucide-react';
 import { UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
-import { bridge, Peer } from './services/bridge';
+import { bridge, Peer, FilePreviewResponse } from './services/bridge';
 
 interface ChatTab {
   id: string;
@@ -76,7 +82,47 @@ interface QuickActionItem {
   onSelect: () => void;
 }
 
+interface PendingClipboardImage {
+  fileName: string;
+  base64Data: string;
+  sizeKB: number;
+}
+
+interface PreviewModalState {
+  fileName: string;
+  filePath: string;
+  loading: boolean;
+  error: string | null;
+  data: FilePreviewResponse | null;
+}
+
 const GROUP_TAB_ID = 'group';
+const PREVIEWABLE_EXTENSIONS = [
+  'png',
+  'jpg',
+  'jpeg',
+  'webp',
+  'gif',
+  'txt',
+  'log',
+  'md',
+  'json',
+  'csv',
+  'xml',
+  'yml',
+  'yaml'
+];
+
+function isPreviewableFile(fileName: string): boolean {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  return PREVIEWABLE_EXTENSIONS.includes(ext);
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
 
 function formatUptime(totalSeconds: number): string {
   const hrs = Math.floor(totalSeconds / 3600);
@@ -126,9 +172,16 @@ export default function App() {
   const [paletteQuery, setPaletteQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
 
+  // Ctrl+V Pano Görseli ve Dosya Okuyucu Modal State'leri
+  const [pendingImage, setPendingImage] = useState<PendingClipboardImage | null>(null);
+  const [isSendingImage, setIsSendingImage] = useState(false);
+  const [previewModal, setPreviewModal] = useState<PreviewModalState | null>(null);
+  const [imageZoomed, setImageZoomed] = useState(false);
+
   const activeTabRef = useRef<string>(GROUP_TAB_ID);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
+  const messageInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     activeTabRef.current = activeTabId;
@@ -152,7 +205,7 @@ export default function App() {
     return () => clearInterval(timer);
   }, [isLoggedIn]);
 
-  // --- CTRL + K KLAVYE KISAYOLU ---
+  // --- KLAVYE KISAYOLLARI (CTRL+K, ESC) ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -163,19 +216,75 @@ export default function App() {
         setPaletteQuery('');
         setSelectedIndex(0);
       } else if (e.key === 'Escape') {
-        setIsPaletteOpen(false);
+        if (previewModal) {
+          setPreviewModal(null);
+        } else if (isPaletteOpen) {
+          setIsPaletteOpen(false);
+        } else if (pendingImage) {
+          setPendingImage(null);
+        }
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isLoggedIn]);
+  }, [isLoggedIn, previewModal, isPaletteOpen, pendingImage]);
 
   useEffect(() => {
     if (isPaletteOpen) {
       setTimeout(() => paletteInputRef.current?.focus(), 20);
     }
   }, [isPaletteOpen]);
+
+  // --- CTRL + V PANO (CLIPBOARD) EKRAN GÖRÜNTÜSÜ YAKALAMA ---
+  const processClipboardItems = (items: DataTransferItemList | undefined): boolean => {
+    if (!items) return false;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const blob = item.getAsFile();
+        if (!blob) continue;
+
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = reader.result as string;
+          const now = new Date();
+          const stamp = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+            now.getDate()
+          ).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}-${String(
+            now.getMinutes()
+          ).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}`;
+          const ext = item.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+
+          setPendingImage({
+            fileName: `screenshot_${stamp}.${ext}`,
+            base64Data: result,
+            sizeKB: Math.max(1, Math.round(blob.size / 1024))
+          });
+          setTimeout(() => messageInputRef.current?.focus(), 20);
+        };
+        reader.readAsDataURL(blob);
+        return true;
+      }
+    }
+    return false;
+  };
+
+  useEffect(() => {
+    if (!isLoggedIn) return;
+
+    const handleGlobalPaste = (e: ClipboardEvent) => {
+      if (isPaletteOpen || previewModal) return;
+      const handled = processClipboardItems(e.clipboardData?.items);
+      if (handled) {
+        e.preventDefault();
+      }
+    };
+
+    window.addEventListener('paste', handleGlobalPaste);
+    return () => window.removeEventListener('paste', handleGlobalPaste);
+  }, [isLoggedIn, isPaletteOpen, previewModal]);
 
   // --- MASAÜSTÜ BİLDİRİM YARDIMCISI ---
   const triggerDesktopNotification = (title: string, body: string, targetTabId: string) => {
@@ -412,6 +521,41 @@ export default function App() {
     };
   }, [isLoggedIn]);
 
+  // --- DOSYA ÖNİZLEME / OKUYUCU AÇMA ---
+  const handleOpenFilePreview = async (file: FileAttachment) => {
+    setImageZoomed(false);
+    setPreviewModal({
+      fileName: file.fileName,
+      filePath: file.filePath,
+      loading: true,
+      error: null,
+      data: null
+    });
+
+    try {
+      const response = await bridge.readFilePreview(file.filePath);
+      setPreviewModal((prev) =>
+        prev
+          ? {
+              ...prev,
+              loading: false,
+              data: response
+            }
+          : null
+      );
+    } catch (err) {
+      setPreviewModal((prev) =>
+        prev
+          ? {
+              ...prev,
+              loading: false,
+              error: typeof err === 'string' ? err : 'Dosya içeriği okunamadı. Backend komutu veya dosya yolunu kontrol edin.'
+            }
+          : null
+      );
+    }
+  };
+
   // --- KOPYALAMA YARDIMCISI ---
   const handleCopy = async (id: string, content: string) => {
     try {
@@ -445,7 +589,7 @@ export default function App() {
             id: crypto.randomUUID(),
             sender_id: 'SYSTEM',
             sender_name: 'Sistem',
-            text: 'P2P şifreli ağ bağlantısı kuruldu. Komut listesi için /help, hızlı geçiş için Ctrl+K kullanabilirsiniz.',
+            text: 'P2P şifreli ağ bağlantısı kuruldu. Ekran görüntüsü yapıştırmak için Ctrl+V, komutlar için /help kullanabilirsiniz.',
             timestamp: new Date().toLocaleTimeString([], {
               hour: '2-digit',
               minute: '2-digit',
@@ -466,6 +610,8 @@ export default function App() {
     setIsLoggedIn(false);
     setIsPaletteOpen(false);
     setIsDragging(false);
+    setPendingImage(null);
+    setPreviewModal(null);
     setPeers([]);
     setHistories({ [GROUP_TAB_ID]: [] });
     setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -565,7 +711,7 @@ export default function App() {
             id: crypto.randomUUID(),
             sender_id: 'SYSTEM',
             sender_name: 'Sistem',
-            text: 'Kullanılabilir Komutlar ve Kısayollar:\n• /clear — Aktif sekmedeki mesaj geçmişini temizler.\n• /help — Bu yardım menüsünü gösterir.\n• Ctrl + K — Hızlı geçiş menüsünü açar.\n• Sürükle-Bırak — Pencereye bırakılan dosyaları aktif kanala otomatik gönderir.',
+            text: 'Kullanılabilir Komutlar ve Kısayollar:\n• /clear — Aktif sekmedeki mesaj geçmişini temizler.\n• /help — Bu yardım menüsünü gösterir.\n• Ctrl + V — Panodaki ekran görüntüsünü yapıştırıp gönderir.\n• Ctrl + K — Hızlı geçiş menüsünü açar.\n• Sürükle-Bırak — Pencereye bırakılan dosyaları aktif kanala otomatik gönderir.',
             timestamp: new Date().toLocaleTimeString([], {
               hour: '2-digit',
               minute: '2-digit',
@@ -579,9 +725,54 @@ export default function App() {
     }
   };
 
-  // --- MESAJ GÖNDERME ---
+  // --- MESAJ VE PANO GÖRSELİ GÖNDERME ---
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
+    const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
+
+    // 1. Önce panodan yapıştırılmış bekleyen ekran görüntüsü varsa onu gönder
+    if (pendingImage && !isSendingImage) {
+      const imageToSend = pendingImage;
+      setIsSendingImage(true);
+      try {
+        const savedPath = await bridge.sendClipboardImage(
+          targetId,
+          imageToSend.fileName,
+          imageToSend.base64Data
+        );
+
+        const imgMsg: ChatMessage = {
+          id: crypto.randomUUID(),
+          sender_id: 'me',
+          sender_name: username,
+          text: imageToSend.fileName,
+          timestamp: new Date().toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit'
+          }),
+          isMine: true,
+          file: {
+            fileName: imageToSend.fileName,
+            filePath: savedPath || imageToSend.fileName,
+            direction: 'sent'
+          }
+        };
+
+        setHistories((prev) => ({
+          ...prev,
+          [activeTabId]: [...(prev[activeTabId] || []), imgMsg]
+        }));
+        setPendingImage(null);
+      } catch (err) {
+        console.error('Ekran görüntüsü gönderilemedi:', err);
+        alert('Ekran görüntüsü gönderilemedi. Backend send_clipboard_image komutunu kontrol edin.');
+      } finally {
+        setIsSendingImage(false);
+      }
+    }
+
+    // 2. Metin kutusunda yazı varsa metni de gönder
     const trimmed = inputText.trim();
     if (!trimmed) return;
 
@@ -591,8 +782,6 @@ export default function App() {
       runSlashCommand(trimmed);
       return;
     }
-
-    const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
 
     const newMsg: ChatMessage = {
       id: crypto.randomUUID(),
@@ -768,6 +957,129 @@ export default function App() {
   // --- EKRAN 2: MODERN SEKMELİ SOHBET ARAYÜZÜ ---
   return (
     <div className="flex h-screen w-screen bg-[#09090b] text-zinc-100 font-sans select-none relative">
+      {/* DOSYA OKUYUCU / ÖNİZLEYİCİ MODALI (.png, .jpg, .txt) */}
+      {previewModal && (
+        <div
+          onClick={() => setPreviewModal(null)}
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex items-center justify-center p-6"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-4xl max-h-[88vh] bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
+          >
+            {/* Modal Üst Başlık */}
+            <div className="px-5 py-3.5 border-b border-zinc-800 bg-zinc-950/70 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center shrink-0">
+                  {previewModal.data?.file_type === 'image' ? (
+                    <ImageIcon className="w-4 h-4 text-emerald-400" />
+                  ) : (
+                    <FileText className="w-4 h-4 text-emerald-400" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-zinc-100 truncate">
+                    {previewModal.fileName}
+                  </div>
+                  <div className="text-[11px] font-mono text-zinc-500 truncate">
+                    {previewModal.filePath}
+                    {previewModal.data ? ` • ${formatBytes(previewModal.data.file_size)}` : ''}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                {previewModal.data?.file_type === 'image' && (
+                  <button
+                    type="button"
+                    onClick={() => setImageZoomed((prev) => !prev)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 transition-colors"
+                  >
+                    {imageZoomed ? (
+                      <>
+                        <ZoomOut className="w-3.5 h-3.5" />
+                        <span>Sığdır</span>
+                      </>
+                    ) : (
+                      <>
+                        <ZoomIn className="w-3.5 h-3.5" />
+                        <span>%100 Boyut</span>
+                      </>
+                    )}
+                  </button>
+                )}
+
+                {previewModal.data?.file_type === 'text' && (
+                  <button
+                    type="button"
+                    onClick={() => handleCopy('modal-text', previewModal.data!.content)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 transition-colors"
+                  >
+                    {copiedId === 'modal-text' ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        <span className="text-emerald-400">Kopyalandı</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        <span>İçeriği Kopyala</span>
+                      </>
+                    )}
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => setPreviewModal(null)}
+                  className="p-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors"
+                  title="Kapat (ESC)"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Modal İçerik Alanı */}
+            <div className="flex-1 overflow-auto p-6 bg-[#09090b] flex items-center justify-center select-text">
+              {previewModal.loading && (
+                <div className="flex flex-col items-center gap-3 py-16 text-zinc-400">
+                  <Loader2 className="w-7 h-7 text-emerald-400 animate-spin" />
+                  <span className="text-xs">Dosya okunuyor...</span>
+                </div>
+              )}
+
+              {previewModal.error && (
+                <div className="flex flex-col items-center text-center gap-2 py-12 max-w-md">
+                  <AlertCircle className="w-8 h-8 text-rose-400" />
+                  <p className="text-sm font-medium text-zinc-200">Önizleme Açılamadı</p>
+                  <p className="text-xs text-zinc-400">{previewModal.error}</p>
+                </div>
+              )}
+
+              {previewModal.data?.file_type === 'image' && (
+                <div className="w-full h-full flex items-center justify-center overflow-auto">
+                  <img
+                    src={previewModal.data.content}
+                    alt={previewModal.fileName}
+                    onClick={() => setImageZoomed((prev) => !prev)}
+                    className={`rounded-xl border border-zinc-800 shadow-lg cursor-zoom-in transition-all ${
+                      imageZoomed ? 'max-w-none' : 'max-h-[70vh] max-w-full object-contain'
+                    }`}
+                  />
+                </div>
+              )}
+
+              {previewModal.data?.file_type === 'text' && (
+                <pre className="w-full h-full min-h-[300px] p-4 rounded-xl bg-zinc-950 border border-zinc-800/90 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed overflow-auto self-start">
+                  {previewModal.data.content || '(Boş dosya)'}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* SÜRÜKLE-BIRAK OVERLAY */}
       {isDragging && (
         <div className="fixed inset-0 z-50 bg-zinc-950/80 backdrop-blur-md flex items-center justify-center p-8 pointer-events-none">
@@ -1039,7 +1351,7 @@ export default function App() {
             <div className="h-full flex flex-col items-center justify-center text-center text-zinc-500">
               <p className="text-sm">Henüz mesaj yok</p>
               <p className="text-xs text-zinc-600 mt-1">
-                Mesaj yazabilir veya dosya sürükleyip bırakabilirsiniz
+                Mesaj yazabilir, ekran görüntüsü yapıştırabilir (Ctrl+V) veya dosya sürükleyebilirsiniz
               </p>
             </div>
           )}
@@ -1056,6 +1368,7 @@ export default function App() {
             }
 
             const hasCode = !msg.file && isCodeMessage(msg.text);
+            const canPreview = msg.file ? isPreviewableFile(msg.file.fileName) : false;
 
             return (
               <div
@@ -1071,7 +1384,7 @@ export default function App() {
 
                 {msg.file ? (
                   <div
-                    className={`w-full max-w-sm p-3.5 rounded-2xl border transition-all ${
+                    className={`w-full max-w-md p-3.5 rounded-2xl border transition-all ${
                       msg.isMine
                         ? 'bg-emerald-500/10 border-emerald-500/25'
                         : 'bg-zinc-900/90 border-zinc-800'
@@ -1079,7 +1392,10 @@ export default function App() {
                   >
                     <div className="flex items-start gap-3">
                       <div
+                        onClick={() => canPreview && handleOpenFilePreview(msg.file!)}
                         className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                          canPreview ? 'cursor-pointer hover:opacity-80' : ''
+                        } ${
                           msg.isMine
                             ? 'bg-emerald-500/20 text-emerald-400'
                             : 'bg-zinc-800 text-zinc-300'
@@ -1100,7 +1416,13 @@ export default function App() {
                             </span>
                           )}
                         </div>
-                        <div className="text-sm font-medium text-zinc-100 truncate" title={msg.file.fileName}>
+                        <div
+                          onClick={() => canPreview && handleOpenFilePreview(msg.file!)}
+                          className={`text-sm font-medium text-zinc-100 truncate ${
+                            canPreview ? 'cursor-pointer hover:text-emerald-400 transition-colors' : ''
+                          }`}
+                          title={msg.file.fileName}
+                        >
                           {msg.file.fileName}
                         </div>
                         <div className="text-[11px] font-mono text-zinc-500 truncate mt-1" title={msg.file.filePath}>
@@ -1108,18 +1430,32 @@ export default function App() {
                         </div>
                       </div>
 
-                      <button
-                        type="button"
-                        onClick={() => handleCopy(msg.id, msg.file!.filePath)}
-                        title="Dosya yolunu kopyala"
-                        className="p-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors shrink-0"
-                      >
-                        {copiedId === msg.id ? (
-                          <Check className="w-3.5 h-3.5 text-emerald-400" />
-                        ) : (
-                          <Copy className="w-3.5 h-3.5" />
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {canPreview && (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenFilePreview(msg.file!)}
+                            title="Dosyayı Oku / Önizle"
+                            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/25 text-emerald-300 text-xs font-medium transition-colors"
+                          >
+                            <Eye className="w-3.5 h-3.5" />
+                            <span>Önizle</span>
+                          </button>
                         )}
-                      </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleCopy(msg.id, msg.file!.filePath)}
+                          title="Dosya yolunu kopyala"
+                          className="p-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors"
+                        >
+                          {copiedId === msg.id ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
                     </div>
                   </div>
                 ) : (
@@ -1166,8 +1502,38 @@ export default function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Alt Mesaj Gönderme Çubuğu */}
-        <div className="p-4 bg-[#0c0c0f] border-t border-zinc-800/80">
+        {/* Alt Mesaj Gönderme Çubuğu + Ctrl+V Pano Görsel Önizleme */}
+        <div className="p-4 bg-[#0c0c0f] border-t border-zinc-800/80 space-y-3">
+          {pendingImage && (
+            <div className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-zinc-900 border border-emerald-500/30">
+              <div className="flex items-center gap-3 min-w-0">
+                <img
+                  src={pendingImage.base64Data}
+                  alt="Pano önizleme"
+                  className="w-12 h-12 rounded-lg object-cover border border-zinc-700 shrink-0"
+                />
+                <div className="min-w-0">
+                  <div className="text-xs font-medium text-emerald-400 flex items-center gap-1.5">
+                    <ImageIcon className="w-3.5 h-3.5" />
+                    <span>Panodan Ekran Görüntüsü Hazır</span>
+                  </div>
+                  <div className="text-xs text-zinc-300 truncate mt-0.5">
+                    {pendingImage.fileName} • {pendingImage.sizeKB} KB
+                  </div>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setPendingImage(null)}
+                title="İptal Et (ESC)"
+                className="p-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           <form onSubmit={handleSendMessage} className="flex items-center gap-3">
             <button
               type="button"
@@ -1179,22 +1545,34 @@ export default function App() {
             </button>
 
             <input
+              ref={messageInputRef}
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
+              onPaste={(e) => {
+                const handled = processClipboardItems(e.clipboardData?.items);
+                if (handled) e.preventDefault();
+              }}
               placeholder={
-                activeTab.isGroup
-                  ? 'Gruba mesaj yazın, dosya sürükleyin veya /help deneyin...'
-                  : `@${activeTab.title} kullanıcısına özel mesaj yazın...`
+                pendingImage
+                  ? 'Ekran görüntüsünü göndermek için Enter’a basın...'
+                  : activeTab.isGroup
+                    ? 'Gruba mesaj yazın, ekran görüntüsü yapıştırın (Ctrl+V) veya /help deneyin...'
+                    : `@${activeTab.title} kullanıcısına özel mesaj yazın...`
               }
               className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/10 transition-all"
             />
 
             <button
               type="submit"
-              className="px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-semibold text-sm flex items-center gap-2 shadow-lg shadow-emerald-500/10 transition-all shrink-0"
+              disabled={isSendingImage}
+              className="px-5 py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-zinc-950 font-semibold text-sm flex items-center gap-2 shadow-lg shadow-emerald-500/10 transition-all shrink-0"
             >
-              <Send className="w-4 h-4" />
+              {isSendingImage ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
               <span>Gönder</span>
             </button>
           </form>
