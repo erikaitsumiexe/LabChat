@@ -1,4 +1,11 @@
-import { useState, useEffect, useRef, FormEvent } from 'react';
+import {
+  useState,
+  useEffect,
+  useRef,
+  FormEvent,
+  MouseEvent,
+  KeyboardEvent as ReactKeyboardEvent
+} from 'react';
 import {
   Shield,
   Users,
@@ -34,6 +41,8 @@ import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
 import { bridge, Peer, FilePreviewResponse } from './services/bridge';
 
+type MessageDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'read';
+
 interface ChatTab {
   id: string;
   title: string;
@@ -49,17 +58,21 @@ interface FileAttachment {
 
 interface ChatMessage {
   id: string;
+  backendMsgId?: string;
   sender_id: string;
   sender_name: string;
   text: string;
   timestamp: string;
   isMine: boolean;
-  delivered?: boolean;
+  isPrivate?: boolean;
+  status?: MessageDeliveryStatus;
   isSystem?: boolean;
   file?: FileAttachment;
 }
 
 interface IncomingMessagePayload {
+  msg_id?: string;
+  id?: string;
   sender_id: string;
   sender_name?: string;
   text: string;
@@ -68,6 +81,8 @@ interface IncomingMessagePayload {
 }
 
 interface IncomingFilePayload {
+  msg_id?: string;
+  id?: string;
   sender_id: string;
   sender_name?: string;
   file_path: string;
@@ -76,8 +91,18 @@ interface IncomingFilePayload {
   is_private?: boolean;
 }
 
+interface MessageStatusPayload {
+  msg_id: string;
+  status: 'queued' | 'sent';
+}
+
 interface MessageAckPayload {
   msg_id: string;
+  sender_id?: string;
+}
+
+interface MessageReadPayload {
+  msg_ids: string[];
   sender_id?: string;
 }
 
@@ -156,6 +181,15 @@ function cleanCodeContent(text: string): string {
   return text;
 }
 
+function mergeMessageStatus(
+  current: MessageDeliveryStatus | undefined,
+  incoming: MessageDeliveryStatus
+): MessageDeliveryStatus {
+  if (current === 'read' || incoming === 'read') return 'read';
+  if (current === 'delivered' || incoming === 'delivered') return 'delivered';
+  return incoming;
+}
+
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [username, setUsername] = useState('');
@@ -189,8 +223,11 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
   const messageInputRef = useRef<HTMLInputElement | null>(null);
-  // Yerel ağda ACK olayının invoke dönüşünden milisaniyeler önce gelme ihtimaline karşı tampon
-  const pendingAcksRef = useRef<Set<string>>(new Set());
+
+  // Event'lerin invoke dönüşünden önce gelme ihtimaline karşı durum tamponu
+  const earlyStatusMapRef = useRef(new Map());
+  // Aynı mesaj için tekrar markAsRead çağrılmasını önleyen takip kümesi
+  const sentReadReceiptsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     activeTabRef.current = activeTabId;
@@ -199,6 +236,31 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [histories, activeTabId]);
+
+  // --- AKTİF DM SEKMESİNDE OKUNMAMIŞ MESAJLAR İÇİN MARK_AS_READ TETİKLEYİCİSİ ---
+  useEffect(() => {
+    if (!isLoggedIn || activeTabId === GROUP_TAB_ID) return;
+
+    const activeMessages = histories[activeTabId] || [];
+    const unreadMsgIds = activeMessages
+      .filter(
+        (m) =>
+          !m.isMine &&
+          !m.isSystem &&
+          Boolean(m.backendMsgId) &&
+          !sentReadReceiptsRef.current.has(m.backendMsgId!)
+      )
+      .map((m) => m.backendMsgId!);
+
+    if (unreadMsgIds.length === 0) return;
+
+    unreadMsgIds.forEach((id) => sentReadReceiptsRef.current.add(id));
+
+    bridge.markAsRead(activeTabId, unreadMsgIds).catch((err) => {
+      console.error('markAsRead gönderilemedi:', err);
+      unreadMsgIds.forEach((id) => sentReadReceiptsRef.current.delete(id));
+    });
+  }, [isLoggedIn, activeTabId, histories]);
 
   // --- CANLI OTURUM SAYACI (UPTIME) ---
   useEffect(() => {
@@ -218,7 +280,7 @@ export default function App() {
   useEffect(() => {
     if (!isLoggedIn) return;
 
-    const handleKeyDown = (e: KeyboardEvent) => {
+    const handleKeyDown = (e: globalThis.KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setIsPaletteOpen((prev) => !prev);
@@ -329,9 +391,10 @@ export default function App() {
 
     const msgId = await bridge.sendFile(targetId, filePath);
     const resolvedId = msgId || crypto.randomUUID();
-    const alreadyAcked = pendingAcksRef.current.has(resolvedId);
-    if (alreadyAcked) {
-      pendingAcksRef.current.delete(resolvedId);
+
+    const bufferedStatus = earlyStatusMapRef.current.get(resolvedId);
+    if (bufferedStatus) {
+      earlyStatusMapRef.current.delete(resolvedId);
     }
 
     const fileMsg: ChatMessage = {
@@ -345,7 +408,7 @@ export default function App() {
         second: '2-digit'
       }),
       isMine: true,
-      delivered: alreadyAcked,
+      status: bufferedStatus || 'sent',
       file: {
         fileName,
         filePath,
@@ -398,14 +461,54 @@ export default function App() {
     };
   }, [isLoggedIn, username]);
 
-  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, ACK) ---
+  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, STATUS, ACK, READ) ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
     let unlistenPeers: UnlistenFn | undefined;
     let unlistenMessages: UnlistenFn | undefined;
     let unlistenFiles: UnlistenFn | undefined;
+    let unlistenStatus: UnlistenFn | undefined;
     let unlistenAck: UnlistenFn | undefined;
+    let unlistenRead: UnlistenFn | undefined;
+
+    const applyStatusUpdates = (updates: Array<{ msgId: string; status: MessageDeliveryStatus }>) => {
+      if (updates.length === 0) return;
+
+      const updateMap = new Map<string, MessageDeliveryStatus>();
+      for (const item of updates) {
+        if (!item.msgId) continue;
+        const prevBuffered = earlyStatusMapRef.current.get(item.msgId);
+        const merged = mergeMessageStatus(prevBuffered, item.status);
+        earlyStatusMapRef.current.set(item.msgId, merged);
+        updateMap.set(item.msgId, merged);
+      }
+
+      setHistories((prev) => {
+        let changed = false;
+        const nextHistories: Record<string, ChatMessage[]> = {};
+
+        for (const [tabId, tabMessages] of Object.entries(prev)) {
+          let tabChanged = false;
+          const nextMessages = tabMessages.map((m) => {
+            const incomingStatus = updateMap.get(m.id);
+            if (!incomingStatus) return m;
+
+            earlyStatusMapRef.current.delete(m.id);
+            const nextStatus = mergeMessageStatus(m.status, incomingStatus);
+            if (nextStatus === m.status) return m;
+
+            tabChanged = true;
+            changed = true;
+            return { ...m, status: nextStatus };
+          });
+
+          nextHistories[tabId] = tabChanged ? nextMessages : tabMessages;
+        }
+
+        return changed ? nextHistories : prev;
+      });
+    };
 
     const handleIncomingItem = (
       targetTabId: string,
@@ -464,13 +567,15 @@ export default function App() {
           const isPrivate = Boolean(msg.is_private);
           const targetTabId = isPrivate ? msg.sender_id : GROUP_TAB_ID;
           const displayName = msg.sender_name || msg.sender_id;
+          const backendMsgId = msg.msg_id || msg.id;
 
           handleIncomingItem(
             targetTabId,
             displayName,
             isPrivate,
             {
-              id: crypto.randomUUID(),
+              id: backendMsgId || crypto.randomUUID(),
+              backendMsgId,
               sender_id: msg.sender_id,
               sender_name: displayName,
               text: msg.text,
@@ -481,7 +586,8 @@ export default function App() {
                   minute: '2-digit',
                   second: '2-digit'
                 }),
-              isMine: false
+              isMine: false,
+              isPrivate
             },
             isPrivate ? `LabChat • @${displayName}` : `LabChat • Genel Kanal (${displayName})`,
             msg.text
@@ -493,13 +599,15 @@ export default function App() {
           const isPrivate = Boolean(file.is_private);
           const targetTabId = isPrivate ? file.sender_id : GROUP_TAB_ID;
           const displayName = file.sender_name || file.sender_id;
+          const backendMsgId = file.msg_id || file.id;
 
           handleIncomingItem(
             targetTabId,
             displayName,
             isPrivate,
             {
-              id: crypto.randomUUID(),
+              id: backendMsgId || crypto.randomUUID(),
+              backendMsgId,
               sender_id: file.sender_id,
               sender_name: displayName,
               text: file.file_name,
@@ -511,6 +619,7 @@ export default function App() {
                   second: '2-digit'
                 }),
               isMine: false,
+              isPrivate,
               file: {
                 fileName: file.file_name,
                 filePath: file.file_path,
@@ -524,31 +633,24 @@ export default function App() {
           );
         });
 
+        unlistenStatus = await bridge.onMessageStatus((rawStatus) => {
+          const payload = rawStatus as unknown as MessageStatusPayload;
+          if (!payload?.msg_id || !payload?.status) return;
+          applyStatusUpdates([{ msgId: payload.msg_id, status: payload.status }]);
+        });
+
         unlistenAck = await bridge.onMessageAck((rawAck) => {
-          const ack = rawAck as unknown as MessageAckPayload;
-          if (!ack?.msg_id) return;
+          const payload = rawAck as unknown as MessageAckPayload;
+          if (!payload?.msg_id) return;
+          applyStatusUpdates([{ msgId: payload.msg_id, status: 'delivered' }]);
+        });
 
-          pendingAcksRef.current.add(ack.msg_id);
-
-          setHistories((prev) => {
-            let found = false;
-            const updatedHistories: Record<string, ChatMessage[]> = {};
-
-            for (const [tabId, tabMessages] of Object.entries(prev)) {
-              const hasMsg = tabMessages.some((m) => m.id === ack.msg_id);
-              if (hasMsg) {
-                found = true;
-                pendingAcksRef.current.delete(ack.msg_id);
-                updatedHistories[tabId] = tabMessages.map((m) =>
-                  m.id === ack.msg_id ? { ...m, delivered: true } : m
-                );
-              } else {
-                updatedHistories[tabId] = tabMessages;
-              }
-            }
-
-            return found ? updatedHistories : prev;
-          });
+        unlistenRead = await bridge.onMessageRead((rawRead) => {
+          const payload = rawRead as unknown as MessageReadPayload;
+          if (!payload?.msg_ids || !Array.isArray(payload.msg_ids)) return;
+          applyStatusUpdates(
+            payload.msg_ids.map((id) => ({ msgId: id, status: 'read' as const }))
+          );
         });
       } catch (error) {
         console.error('Listener başlatılırken hata oluştu:', error);
@@ -561,7 +663,9 @@ export default function App() {
       if (unlistenPeers) unlistenPeers();
       if (unlistenMessages) unlistenMessages();
       if (unlistenFiles) unlistenFiles();
+      if (unlistenStatus) unlistenStatus();
       if (unlistenAck) unlistenAck();
+      if (unlistenRead) unlistenRead();
     };
   }, [isLoggedIn]);
 
@@ -631,7 +735,8 @@ export default function App() {
       }
 
       await bridge.joinRoom(username, roomPassword);
-      pendingAcksRef.current.clear();
+      earlyStatusMapRef.current.clear();
+      sentReadReceiptsRef.current.clear();
       setIsLoggedIn(true);
       setActiveTabId(GROUP_TAB_ID);
       setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -664,7 +769,8 @@ export default function App() {
     setIsDragging(false);
     setPendingImage(null);
     setPreviewModal(null);
-    pendingAcksRef.current.clear();
+    earlyStatusMapRef.current.clear();
+    sentReadReceiptsRef.current.clear();
     setPeers([]);
     setHistories({ [GROUP_TAB_ID]: [] });
     setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -721,7 +827,7 @@ export default function App() {
     setActiveTabId(peer.id);
   };
 
-  const handleCloseTab = (e: React.MouseEvent, tabId: string) => {
+  const handleCloseTab = (e: MouseEvent, tabId: string) => {
     e.stopPropagation();
     if (tabId === GROUP_TAB_ID) return;
 
@@ -805,7 +911,7 @@ export default function App() {
             second: '2-digit'
           }),
           isMine: true,
-          delivered: true,
+          status: 'sent',
           file: {
             fileName: imageToSend.fileName,
             filePath: savedPath || imageToSend.fileName,
@@ -841,9 +947,10 @@ export default function App() {
     try {
       const msgId = await bridge.sendMessage(targetId, rawText);
       const resolvedId = msgId || crypto.randomUUID();
-      const alreadyAcked = pendingAcksRef.current.has(resolvedId);
-      if (alreadyAcked) {
-        pendingAcksRef.current.delete(resolvedId);
+
+      const bufferedStatus = earlyStatusMapRef.current.get(resolvedId);
+      if (bufferedStatus) {
+        earlyStatusMapRef.current.delete(resolvedId);
       }
 
       const newMsg: ChatMessage = {
@@ -857,7 +964,7 @@ export default function App() {
           second: '2-digit'
         }),
         isMine: true,
-        delivered: alreadyAcked
+        status: bufferedStatus || 'sent'
       };
 
       setHistories((prev) => ({
@@ -881,6 +988,39 @@ export default function App() {
       await dispatchFileToTarget(selected);
     } catch (err) {
       console.error('Dosya seçme veya gönderme hatası:', err);
+    }
+  };
+
+  // --- 4 AŞAMALI DURUM İKONU RENDER YARDIMCISI ---
+  const renderDeliveryStatus = (status: MessageDeliveryStatus = 'sent') => {
+    switch (status) {
+      case 'queued':
+        return (
+          <span
+            title="Kuyrukta bekliyor (Karşı taraf çevrimdışı)"
+            className="inline-flex items-center text-amber-400/90"
+          >
+            <Clock className="w-3.5 h-3.5" />
+          </span>
+        );
+      case 'sent':
+        return (
+          <span title="Gönderildi" className="inline-flex items-center text-zinc-500">
+            <Check className="w-3.5 h-3.5" />
+          </span>
+        );
+      case 'delivered':
+        return (
+          <span title="İletildi" className="inline-flex items-center text-zinc-400">
+            <CheckCheck className="w-3.5 h-3.5" />
+          </span>
+        );
+      case 'read':
+        return (
+          <span title="Görüldü" className="inline-flex items-center text-emerald-400">
+            <CheckCheck className="w-3.5 h-3.5" />
+          </span>
+        );
     }
   };
 
@@ -943,6 +1083,7 @@ export default function App() {
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
   const currentMessages = histories[activeTabId] || [];
   const activePeer = peers.find((p) => p.id === activeTabId);
+  const onlinePeersCount = peers.filter((p) => p.online).length;
 
   // --- CTRL + K HIZLI GEÇİŞ ÖĞELERİ ---
   const quickItems: QuickActionItem[] = [
@@ -956,7 +1097,7 @@ export default function App() {
     ...peers.map((p) => ({
       id: `peer-${p.id}`,
       label: `@${p.username}`,
-      sublabel: `Özel mesaj başlat • ${p.ip}`,
+      sublabel: `${p.online ? 'Çevrimiçi' : 'Çevrimdışı (Kuyruk)'} • ${p.ip}`,
       category: 'Cihazlar' as const,
       onSelect: () => handleOpenDmTab(p)
     })),
@@ -996,7 +1137,7 @@ export default function App() {
       item.sublabel.toLowerCase().includes(paletteQuery.toLowerCase())
   );
 
-  const handlePaletteKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+  const handlePaletteKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
     if (filteredQuickItems.length === 0) return;
 
     if (e.key === 'ArrowDown') {
@@ -1261,15 +1402,18 @@ export default function App() {
           </button>
         </div>
 
-        {/* Çevrimiçi Düğümler Listesi */}
+        {/* Çevrimiçi / Çevrimdışı Düğümler Listesi */}
         <div className="p-3.5 flex-1 overflow-y-auto">
           <div className="flex items-center justify-between px-2 mb-3 text-xs font-medium text-zinc-400">
             <span className="flex items-center gap-1.5">
               <Users className="w-3.5 h-3.5 text-zinc-500" />
               Ağdaki Cihazlar
             </span>
-            <span className="text-[11px] bg-zinc-800/80 text-zinc-300 px-2 py-0.5 rounded-md font-mono">
-              {peers.length}
+            <span
+              title={`${onlinePeersCount} çevrimiçi / ${peers.length} toplam kayıtlı cihaz`}
+              className="text-[11px] bg-zinc-800/80 text-zinc-300 px-2 py-0.5 rounded-md font-mono"
+            >
+              {onlinePeersCount}/{peers.length}
             </span>
           </div>
 
@@ -1281,6 +1425,8 @@ export default function App() {
             )}
             {peers.map((peer) => {
               const isSelectedDm = activeTabId === peer.id;
+              const isOnline = Boolean(peer.online);
+
               return (
                 <li
                   key={peer.id}
@@ -1293,14 +1439,33 @@ export default function App() {
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className="relative shrink-0">
-                      <div className="w-8 h-8 rounded-lg bg-zinc-800 border border-zinc-700/80 flex items-center justify-center text-xs font-semibold text-zinc-200 uppercase">
+                      <div
+                        className={`w-8 h-8 rounded-lg border flex items-center justify-center text-xs font-semibold uppercase transition-colors ${
+                          isOnline
+                            ? 'bg-zinc-800 border-zinc-700/80 text-zinc-200'
+                            : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'
+                        }`}
+                      >
                         {peer.username.slice(0, 2)}
                       </div>
-                      <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-400 ring-2 ring-[#0c0c0f]" />
+                      <span
+                        title={isOnline ? 'Çevrimiçi' : 'Çevrimdışı (Mesajlar kuyruğa alınır)'}
+                        className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-[#0c0c0f] ${
+                          isOnline ? 'bg-emerald-400' : 'bg-zinc-500'
+                        }`}
+                      />
                     </div>
                     <div className="truncate">
-                      <div className="text-sm font-medium truncate">{peer.username}</div>
-                      <div className="text-[11px] text-zinc-500 font-mono truncate">{peer.ip}</div>
+                      <div
+                        className={`text-sm font-medium truncate ${
+                          isOnline ? 'text-zinc-200' : 'text-zinc-400'
+                        }`}
+                      >
+                        {peer.username}
+                      </div>
+                      <div className="text-[11px] text-zinc-500 font-mono truncate">
+                        {isOnline ? peer.ip : `${peer.ip} • Çevrimdışı`}
+                      </div>
                     </div>
                   </div>
                   <span className="text-[10px] font-medium text-zinc-400 opacity-0 group-hover:opacity-100 bg-zinc-800 px-2 py-0.5 rounded-md transition-opacity">
@@ -1387,6 +1552,17 @@ export default function App() {
                   <span>X25519 E2EE Aktif</span>
                 </span>
               )}
+
+              {/* Çevrimdışı Peer Kuyruk Uyarısı */}
+              {!activeTab.isGroup && activePeer && !activePeer.online && (
+                <span
+                  title="Kullanıcı şu an çevrimdışı; gönderilen mesaj ve dosyalar çevrimiçi olduğu an otomatik iletilir."
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/25 text-amber-400"
+                >
+                  <Clock className="w-3 h-3" />
+                  <span>Çevrimdışı • Kuyruk Modu</span>
+                </span>
+              )}
             </div>
           </div>
 
@@ -1445,30 +1621,13 @@ export default function App() {
                 key={msg.id}
                 className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}
               >
-                {/* Gönderen, Saat ve Teslim Onayı (Tek Tik / Yeşil Çift Tik) */}
+                {/* Gönderen, Saat ve 4 Aşamalı Teslim/Okundu İkonu */}
                 <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px] text-zinc-500">
                   {!msg.isMine && (
                     <span className="font-medium text-zinc-300 mr-0.5">{msg.sender_name}</span>
                   )}
                   <span className="font-mono">{msg.timestamp}</span>
-                  {msg.isMine && (
-                    <span
-                      title={
-                        msg.delivered
-                          ? 'Teslim edildi'
-                          : 'Gönderildi (Teslim onayı bekleniyor)'
-                      }
-                      className={`inline-flex items-center ${
-                        msg.delivered ? 'text-emerald-400' : 'text-zinc-500'
-                      }`}
-                    >
-                      {msg.delivered ? (
-                        <CheckCheck className="w-3.5 h-3.5" />
-                      ) : (
-                        <Check className="w-3.5 h-3.5" />
-                      )}
-                    </span>
-                  )}
+                  {msg.isMine && renderDeliveryStatus(msg.status)}
                 </div>
 
                 {msg.file ? (
@@ -1647,7 +1806,9 @@ export default function App() {
                   ? 'Ekran görüntüsünü göndermek için Enter’a basın...'
                   : activeTab.isGroup
                     ? 'Gruba mesaj yazın, ekran görüntüsü yapıştırın (Ctrl+V) veya /help deneyin...'
-                    : `@${activeTab.title} kullanıcısına X25519 şifreli mesaj yazın...`
+                    : activePeer && !activePeer.online
+                      ? `@${activeTab.title} çevrimdışı — mesajınız kuyruğa alınacak...`
+                      : `@${activeTab.title} kullanıcısına X25519 şifreli mesaj yazın...`
               }
               className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/10 transition-all"
             />
