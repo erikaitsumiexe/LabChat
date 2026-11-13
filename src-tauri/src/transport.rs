@@ -1,7 +1,7 @@
 use crate::crypto::{self, CryptoSession};
-use crate::discovery::Peer;
+use crate::discovery::{save_known_peers, Peer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -42,6 +42,11 @@ pub enum NetworkPacket {
         msg_ids: Vec<String>,
         sender_id: String,
     },
+    AdminAction {
+        action: String, // "ban" | "unban" | "mute" | "unmute"
+        target_id: String,
+        admin_signature: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -81,6 +86,13 @@ pub struct MessageRead {
 pub struct MessageStatus {
     pub msg_id: String,
     pub status: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct AdminNotice {
+    pub action: String,
+    pub target_id: String,
+    pub is_self: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -236,8 +248,12 @@ pub async fn start_tcp_server(
     app: AppHandle,
     my_id: String,
     room_key: [u8; 32],
+    expected_admin_sig: String,
     session: CryptoSession,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
+    banned_ids: Arc<Mutex<HashSet<String>>>,
+    globally_muted_ids: Arc<Mutex<HashSet<String>>>,
+    locally_muted_ids: Arc<Mutex<HashSet<String>>>,
 ) {
     let listener = TcpListener::bind(format!("0.0.0.0:{}", TCP_PORT))
         .await
@@ -249,8 +265,12 @@ pub async fn start_tcp_server(
                 let app_clone = app.clone();
                 let my_id_clone = my_id.clone();
                 let room_key_clone = room_key;
+                let admin_sig_clone = expected_admin_sig.clone();
                 let session_clone = session.clone();
                 let peers_clone = peers.clone();
+                let banned_clone = banned_ids.clone();
+                let g_muted_clone = globally_muted_ids.clone();
+                let l_muted_clone = locally_muted_ids.clone();
 
                 tokio::spawn(async move {
                     let mut length_buf = [0u8; 4];
@@ -292,17 +312,25 @@ pub async fn start_tcp_server(
                                             timestamp,
                                             is_private,
                                         } => {
+                                            if banned_clone.lock().await.contains(&sender_id)
+                                                || g_muted_clone.lock().await.contains(&sender_id)
+                                            {
+                                                return;
+                                            }
+
                                             let sender_ip = {
                                                 let p_map = peers_clone.lock().await;
                                                 p_map.get(&sender_id).map(|p| p.ip.clone())
                                             };
 
-                                            let title = if is_private {
-                                                format!("{} (Özel Mesaj)", sender_name)
-                                            } else {
-                                                format!("{} (#Genel)", sender_name)
-                                            };
-                                            send_desktop_notification(&app_clone, &title, &text);
+                                            if !l_muted_clone.lock().await.contains(&sender_id) {
+                                                let title = if is_private {
+                                                    format!("{} (Özel Mesaj)", sender_name)
+                                                } else {
+                                                    format!("{} (#Genel)", sender_name)
+                                                };
+                                                send_desktop_notification(&app_clone, &title, &text);
+                                            }
 
                                             let ui_msg = ReceivedMessage {
                                                 msg_id: msg_id.clone(),
@@ -331,6 +359,12 @@ pub async fn start_tcp_server(
                                             timestamp,
                                             is_private,
                                         } => {
+                                            if banned_clone.lock().await.contains(&sender_id)
+                                                || g_muted_clone.lock().await.contains(&sender_id)
+                                            {
+                                                return;
+                                            }
+
                                             if let Ok(saved_path) =
                                                 save_incoming_file(&file_name, &data).await
                                             {
@@ -339,12 +373,18 @@ pub async fn start_tcp_server(
                                                     p_map.get(&sender_id).map(|p| p.ip.clone())
                                                 };
 
-                                                let title = if is_private {
-                                                    format!("{} - Dosya Gönderdi", sender_name)
-                                                } else {
-                                                    format!("{} (#Genel) - Dosya", sender_name)
-                                                };
-                                                send_desktop_notification(&app_clone, &title, &file_name);
+                                                if !l_muted_clone.lock().await.contains(&sender_id) {
+                                                    let title = if is_private {
+                                                        format!("{} - Dosya Gönderdi", sender_name)
+                                                    } else {
+                                                        format!("{} (#Genel) - Dosya", sender_name)
+                                                    };
+                                                    send_desktop_notification(
+                                                        &app_clone,
+                                                        &title,
+                                                        &file_name,
+                                                    );
+                                                }
 
                                                 let ui_file = ReceivedFile {
                                                     msg_id: msg_id.clone(),
@@ -378,10 +418,69 @@ pub async fn start_tcp_server(
                                                 MessageRead { msg_ids, sender_id },
                                             );
                                         }
+                                        NetworkPacket::AdminAction {
+                                            action,
+                                            target_id,
+                                            admin_signature,
+                                        } => {
+                                            if admin_signature != admin_sig_clone {
+                                                return;
+                                            }
+
+                                            let is_self = target_id == my_id_clone;
+                                            match action.as_str() {
+                                                "ban" => {
+                                                    banned_clone
+                                                        .lock()
+                                                        .await
+                                                        .insert(target_id.clone());
+                                                    let mut p_map = peers_clone.lock().await;
+                                                    p_map.remove(&target_id);
+                                                    let list: Vec<Peer> =
+                                                        p_map.values().cloned().collect();
+                                                    let _ = app_clone.emit("peers-updated", list);
+                                                    save_known_peers(&p_map).await;
+                                                }
+                                                "unban" => {
+                                                    banned_clone.lock().await.remove(&target_id);
+                                                }
+                                                "mute" => {
+                                                    g_muted_clone
+                                                        .lock()
+                                                        .await
+                                                        .insert(target_id.clone());
+                                                    let mut p_map = peers_clone.lock().await;
+                                                    if let Some(p) = p_map.get_mut(&target_id) {
+                                                        p.is_muted = true;
+                                                    }
+                                                    let list: Vec<Peer> =
+                                                        p_map.values().cloned().collect();
+                                                    let _ = app_clone.emit("peers-updated", list);
+                                                }
+                                                "unmute" => {
+                                                    g_muted_clone.lock().await.remove(&target_id);
+                                                    let mut p_map = peers_clone.lock().await;
+                                                    if let Some(p) = p_map.get_mut(&target_id) {
+                                                        p.is_muted = false;
+                                                    }
+                                                    let list: Vec<Peer> =
+                                                        p_map.values().cloned().collect();
+                                                    let _ = app_clone.emit("peers-updated", list);
+                                                }
+                                                _ => {}
+                                            }
+
+                                            let _ = app_clone.emit(
+                                                "admin-notice",
+                                                AdminNotice {
+                                                    action,
+                                                    target_id,
+                                                    is_self,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
-                            } else {
-                                println!("Uyarı: Farklı oda parolalı veya yetkisiz paket reddedildi.");
                             }
                         }
                     }

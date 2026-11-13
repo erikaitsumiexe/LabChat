@@ -1,11 +1,15 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use crypto::CryptoSession;
-use discovery::Peer;
+use discovery::{save_known_peers, Peer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Emitter, Manager, State, WindowEvent,
+};
 use tokio::fs;
 use tokio::sync::{mpsc, Mutex};
 use transport::{MessageStatus, NetworkPacket, OutboxItem};
@@ -15,12 +19,24 @@ mod crypto;
 mod discovery;
 mod transport;
 
+// Uygulamaya gömülü Admin Panel şifresi
+const ADMIN_SECRET_PASSWORD: &str = "LABCHAT_ADMIN_2026";
+
+fn compute_admin_signature(password: &str) -> String {
+    blake3::hash(format!("labchat_admin_sig::{}", password).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 struct AppState {
     my_id: Mutex<String>,
     my_username: Mutex<String>,
     room_key: Mutex<[u8; 32]>,
     crypto_session: Mutex<Option<CryptoSession>>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
+    banned_ids: Arc<Mutex<HashSet<String>>>,
+    globally_muted_ids: Arc<Mutex<HashSet<String>>>,
+    locally_muted_ids: Arc<Mutex<HashSet<String>>>,
     outbox: Arc<Mutex<Vec<OutboxItem>>>,
     started: Mutex<bool>,
 }
@@ -77,8 +93,6 @@ async fn join_room(
     }
 
     let my_id = get_or_create_persistent_id(&username).await;
-    println!("Backend: {} ({}) giriş yaptı. X25519 ve Outbox başlatılıyor...", username, my_id);
-
     *state.my_id.lock().await = my_id.clone();
     *state.my_username.lock().await = username.clone();
 
@@ -104,18 +118,144 @@ async fn join_room(
         }
     });
 
+    let expected_sig = compute_admin_signature(ADMIN_SECRET_PASSWORD);
+
     discovery::start_discovery(
         app.clone(),
         my_id.clone(),
         username,
         pub_key_bytes,
         state.peers.clone(),
+        state.banned_ids.clone(),
+        state.globally_muted_ids.clone(),
+        state.locally_muted_ids.clone(),
         online_tx,
     )
     .await;
-    transport::start_tcp_server(app, my_id, key, session, state.peers.clone()).await;
+
+    transport::start_tcp_server(
+        app,
+        my_id,
+        key,
+        expected_sig,
+        session,
+        state.peers.clone(),
+        state.banned_ids.clone(),
+        state.globally_muted_ids.clone(),
+        state.locally_muted_ids.clone(),
+    )
+    .await;
 
     *started = true;
+    Ok(())
+}
+
+#[tauri::command]
+fn verify_admin_password(password: String) -> bool {
+    password == ADMIN_SECRET_PASSWORD
+}
+
+#[tauri::command]
+async fn admin_moderate_user(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    admin_password: String,
+    target_id: String,
+    action: String,
+) -> Result<(), String> {
+    if admin_password != ADMIN_SECRET_PASSWORD {
+        return Err("Yetkisiz işlem: Hatalı Admin şifresi!".to_string());
+    }
+
+    let sig = compute_admin_signature(&admin_password);
+    let room_key = *state.room_key.lock().await;
+    let peers_snapshot = state.peers.lock().await.clone();
+
+    match action.as_str() {
+        "ban" => {
+            state.banned_ids.lock().await.insert(target_id.clone());
+            let mut p_map = state.peers.lock().await;
+            p_map.remove(&target_id);
+            let list: Vec<Peer> = p_map.values().cloned().collect();
+            let _ = app.emit("peers-updated", list);
+            save_known_peers(&p_map).await;
+        }
+        "unban" => {
+            state.banned_ids.lock().await.remove(&target_id);
+        }
+        "mute" => {
+            state
+                .globally_muted_ids
+                .lock()
+                .await
+                .insert(target_id.clone());
+            let mut p_map = state.peers.lock().await;
+            if let Some(p) = p_map.get_mut(&target_id) {
+                p.is_muted = true;
+            }
+            let list: Vec<Peer> = p_map.values().cloned().collect();
+            let _ = app.emit("peers-updated", list);
+        }
+        "unmute" => {
+            state.globally_muted_ids.lock().await.remove(&target_id);
+            let mut p_map = state.peers.lock().await;
+            if let Some(p) = p_map.get_mut(&target_id) {
+                p.is_muted = false;
+            }
+            let list: Vec<Peer> = p_map.values().cloned().collect();
+            let _ = app.emit("peers-updated", list);
+        }
+        _ => return Err("Geçersiz admin aksiyonu".to_string()),
+    }
+
+    let packet = NetworkPacket::AdminAction {
+        action,
+        target_id,
+        admin_signature: sig,
+    };
+
+    for peer in peers_snapshot.values().filter(|p| p.online) {
+        let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_peer_muted(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+    muted: bool,
+) -> Result<(), String> {
+    if muted {
+        state.locally_muted_ids.lock().await.insert(peer_id.clone());
+    } else {
+        state.locally_muted_ids.lock().await.remove(&peer_id);
+    }
+
+    let is_globally_muted = state.globally_muted_ids.lock().await.contains(&peer_id);
+    let mut p_map = state.peers.lock().await;
+    if let Some(p) = p_map.get_mut(&peer_id) {
+        p.is_muted = muted || is_globally_muted;
+    }
+    let list: Vec<Peer> = p_map.values().cloned().collect();
+    let _ = app.emit("peers-updated", list);
+    save_known_peers(&p_map).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_peer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<(), String> {
+    let mut p_map = state.peers.lock().await;
+    p_map.remove(&peer_id);
+    let list: Vec<Peer> = p_map.values().cloned().collect();
+    let _ = app.emit("peers-updated", list);
+    save_known_peers(&p_map).await;
     Ok(())
 }
 
@@ -127,6 +267,13 @@ async fn send_message(
     text: String,
 ) -> Result<String, String> {
     let my_id = state.my_id.lock().await.clone();
+    if state.banned_ids.lock().await.contains(&my_id) {
+        return Err("Odadan yasaklandınız!".to_string());
+    }
+    if state.globally_muted_ids.lock().await.contains(&my_id) {
+        return Err("Admin tarafından susturuldunuz!".to_string());
+    }
+
     let my_username = state.my_username.lock().await.clone();
     let room_key = *state.room_key.lock().await;
     let session = state
@@ -214,6 +361,13 @@ async fn send_file_internal(
     file_path: &str,
 ) -> Result<String, String> {
     let my_id = state.my_id.lock().await.clone();
+    if state.banned_ids.lock().await.contains(&my_id) {
+        return Err("Odadan yasaklandınız!".to_string());
+    }
+    if state.globally_muted_ids.lock().await.contains(&my_id) {
+        return Err("Admin tarafından susturuldunuz!".to_string());
+    }
+
     let my_username = state.my_username.lock().await.clone();
     let room_key = *state.room_key.lock().await;
     let session = state
@@ -472,12 +626,68 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            let show_item = MenuItem::with_id(app, "show", "LabChat'i Aç", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "Çıkış", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+
+            let mut tray_builder = TrayIconBuilder::with_id("labchat-tray")
+                .menu(&menu)
+                .tooltip("LabChat - Uçtan Uca Şifreli Ağ Sohbeti")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                });
+
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+
+            tray_builder.build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .manage(AppState {
             my_id: Mutex::new(String::new()),
             my_username: Mutex::new(String::new()),
             room_key: Mutex::new([0u8; 32]),
             crypto_session: Mutex::new(None),
             peers: Arc::new(Mutex::new(HashMap::new())),
+            banned_ids: Arc::new(Mutex::new(HashSet::new())),
+            globally_muted_ids: Arc::new(Mutex::new(HashSet::new())),
+            locally_muted_ids: Arc::new(Mutex::new(HashSet::new())),
             outbox: Arc::new(Mutex::new(Vec::new())),
             started: Mutex::new(false),
         })
@@ -487,7 +697,11 @@ pub fn run() {
             send_file,
             mark_as_read,
             read_file_preview,
-            send_clipboard_image
+            send_clipboard_image,
+            verify_admin_password,
+            admin_moderate_user,
+            set_peer_muted,
+            remove_peer
         ])
         .run(tauri::generate_context!())
         .expect("Tauri backend motoru çöktü!");

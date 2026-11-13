@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,6 +19,8 @@ pub struct Peer {
     pub online: bool,
     #[serde(default)]
     pub last_seen: u64,
+    #[serde(default)]
+    pub is_muted: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,7 +58,7 @@ pub async fn load_known_peers() -> HashMap<String, Peer> {
     HashMap::new()
 }
 
-async fn save_known_peers(peers: &HashMap<String, Peer>) {
+pub async fn save_known_peers(peers: &HashMap<String, Peer>) {
     if let Ok(json) = serde_json::to_vec_pretty(peers) {
         let _ = fs::write(peers_file_path(), json).await;
     }
@@ -68,13 +70,17 @@ pub async fn start_discovery(
     my_username: String,
     my_public_key: [u8; 32],
     peers: Arc<Mutex<HashMap<String, Peer>>>,
+    banned_ids: Arc<Mutex<HashSet<String>>>,
+    globally_muted_ids: Arc<Mutex<HashSet<String>>>,
+    locally_muted_ids: Arc<Mutex<HashSet<String>>>,
     online_tx: mpsc::UnboundedSender<Peer>,
 ) {
     let initial_peers = load_known_peers().await;
     if !initial_peers.is_empty() {
+        let banned = banned_ids.lock().await;
         let mut p_map = peers.lock().await;
         for (k, v) in initial_peers {
-            if k != my_id {
+            if k != my_id && !banned.contains(&k) {
                 p_map.insert(k, v);
             }
         }
@@ -93,6 +99,9 @@ pub async fn start_discovery(
         .expect("Broadcast izni alınamadı!");
 
     let peers_clone = peers.clone();
+    let banned_clone = banned_ids.clone();
+    let g_muted_clone = globally_muted_ids.clone();
+    let l_muted_clone = locally_muted_ids.clone();
     let app_clone = app.clone();
     let my_id_clone = my_id.clone();
 
@@ -102,6 +111,13 @@ pub async fn start_discovery(
             if let Ok((len, addr)) = listen_socket.recv_from(&mut buf).await {
                 if let Ok(packet) = serde_json::from_slice::<AnnouncePacket>(&buf[..len]) {
                     if packet.id != my_id_clone {
+                        if banned_clone.lock().await.contains(&packet.id) {
+                            continue;
+                        }
+
+                        let is_muted = g_muted_clone.lock().await.contains(&packet.id)
+                            || l_muted_clone.lock().await.contains(&packet.id);
+
                         let mut p_map = peers_clone.lock().await;
                         let peer_ip = addr.ip().to_string();
                         let current_ts = now_secs();
@@ -111,6 +127,7 @@ pub async fn start_discovery(
                                 let changed = existing.username != packet.username
                                     || existing.ip != peer_ip
                                     || existing.public_key != packet.public_key
+                                    || existing.is_muted != is_muted
                                     || !existing.online;
                                 (changed, !existing.online)
                             }
@@ -124,6 +141,7 @@ pub async fn start_discovery(
                             public_key: packet.public_key,
                             online: true,
                             last_seen: current_ts,
+                            is_muted,
                         };
 
                         p_map.insert(packet.id, peer_obj.clone());
@@ -143,7 +161,6 @@ pub async fn start_discovery(
         }
     });
 
-    // Çevrimdışı olan kullanıcıları tespit eden bekçi görev
     let peers_watchdog = peers.clone();
     let app_watchdog = app.clone();
     tokio::spawn(async move {
@@ -168,7 +185,6 @@ pub async fn start_discovery(
         }
     });
 
-    // Kendi varlığımızı ağa duyuran yayın döngüsü
     tokio::spawn(async move {
         let announce = AnnouncePacket {
             id: my_id,
