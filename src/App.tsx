@@ -12,6 +12,7 @@ import {
   MessageSquare,
   Copy,
   Check,
+  CheckCheck,
   FileText,
   ArrowUpRight,
   ArrowDownLeft,
@@ -53,6 +54,7 @@ interface ChatMessage {
   text: string;
   timestamp: string;
   isMine: boolean;
+  delivered?: boolean;
   isSystem?: boolean;
   file?: FileAttachment;
 }
@@ -72,6 +74,11 @@ interface IncomingFilePayload {
   file_name: string;
   timestamp?: string;
   is_private?: boolean;
+}
+
+interface MessageAckPayload {
+  msg_id: string;
+  sender_id?: string;
 }
 
 interface QuickActionItem {
@@ -182,6 +189,8 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
   const messageInputRef = useRef<HTMLInputElement | null>(null);
+  // Yerel ağda ACK olayının invoke dönüşünden milisaniyeler önce gelme ihtimaline karşı tampon
+  const pendingAcksRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     activeTabRef.current = activeTabId;
@@ -318,10 +327,15 @@ export default function App() {
     const targetId = tabId === GROUP_TAB_ID ? null : tabId;
     const fileName = filePath.split(/[/\\]/).pop() || filePath;
 
-    await bridge.sendFile(targetId, filePath);
+    const msgId = await bridge.sendFile(targetId, filePath);
+    const resolvedId = msgId || crypto.randomUUID();
+    const alreadyAcked = pendingAcksRef.current.has(resolvedId);
+    if (alreadyAcked) {
+      pendingAcksRef.current.delete(resolvedId);
+    }
 
     const fileMsg: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: resolvedId,
       sender_id: 'me',
       sender_name: username,
       text: fileName,
@@ -331,6 +345,7 @@ export default function App() {
         second: '2-digit'
       }),
       isMine: true,
+      delivered: alreadyAcked,
       file: {
         fileName,
         filePath,
@@ -383,13 +398,14 @@ export default function App() {
     };
   }, [isLoggedIn, username]);
 
-  // --- EVENT LİSTENER KURULUMU ---
+  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, ACK) ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
     let unlistenPeers: UnlistenFn | undefined;
     let unlistenMessages: UnlistenFn | undefined;
     let unlistenFiles: UnlistenFn | undefined;
+    let unlistenAck: UnlistenFn | undefined;
 
     const handleIncomingItem = (
       targetTabId: string,
@@ -507,6 +523,33 @@ export default function App() {
             file.file_name
           );
         });
+
+        unlistenAck = await bridge.onMessageAck((rawAck) => {
+          const ack = rawAck as unknown as MessageAckPayload;
+          if (!ack?.msg_id) return;
+
+          pendingAcksRef.current.add(ack.msg_id);
+
+          setHistories((prev) => {
+            let found = false;
+            const updatedHistories: Record<string, ChatMessage[]> = {};
+
+            for (const [tabId, tabMessages] of Object.entries(prev)) {
+              const hasMsg = tabMessages.some((m) => m.id === ack.msg_id);
+              if (hasMsg) {
+                found = true;
+                pendingAcksRef.current.delete(ack.msg_id);
+                updatedHistories[tabId] = tabMessages.map((m) =>
+                  m.id === ack.msg_id ? { ...m, delivered: true } : m
+                );
+              } else {
+                updatedHistories[tabId] = tabMessages;
+              }
+            }
+
+            return found ? updatedHistories : prev;
+          });
+        });
       } catch (error) {
         console.error('Listener başlatılırken hata oluştu:', error);
       }
@@ -518,6 +561,7 @@ export default function App() {
       if (unlistenPeers) unlistenPeers();
       if (unlistenMessages) unlistenMessages();
       if (unlistenFiles) unlistenFiles();
+      if (unlistenAck) unlistenAck();
     };
   }, [isLoggedIn]);
 
@@ -549,7 +593,10 @@ export default function App() {
           ? {
               ...prev,
               loading: false,
-              error: typeof err === 'string' ? err : 'Dosya içeriği okunamadı. Backend komutu veya dosya yolunu kontrol edin.'
+              error:
+                typeof err === 'string'
+                  ? err
+                  : 'Dosya içeriği okunamadı. Dosya yolunu kontrol edin.'
             }
           : null
       );
@@ -575,11 +622,16 @@ export default function App() {
     if (!username.trim() || !roomPassword.trim()) return;
 
     try {
-      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
+      if (
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        Notification.permission === 'default'
+      ) {
         Notification.requestPermission().catch(() => {});
       }
 
       await bridge.joinRoom(username, roomPassword);
+      pendingAcksRef.current.clear();
       setIsLoggedIn(true);
       setActiveTabId(GROUP_TAB_ID);
       setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -612,6 +664,7 @@ export default function App() {
     setIsDragging(false);
     setPendingImage(null);
     setPreviewModal(null);
+    pendingAcksRef.current.clear();
     setPeers([]);
     setHistories({ [GROUP_TAB_ID]: [] });
     setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -653,7 +706,7 @@ export default function App() {
           id: crypto.randomUUID(),
           sender_id: 'SYSTEM',
           sender_name: 'Sistem',
-          text: `${peer.username} (${peer.ip}) ile uçtan uca şifreli özel sohbet başlatıldı.`,
+          text: `${peer.username} (${peer.ip}) ile X25519 uçtan uca şifreli özel sohbet başlatıldı.`,
           timestamp: new Date().toLocaleTimeString([], {
             hour: '2-digit',
             minute: '2-digit',
@@ -730,7 +783,7 @@ export default function App() {
     e.preventDefault();
     const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
 
-    // 1. Önce panodan yapıştırılmış bekleyen ekran görüntüsü varsa onu gönder
+    // 1. Panodan yapıştırılmış bekleyen ekran görüntüsü varsa gönder
     if (pendingImage && !isSendingImage) {
       const imageToSend = pendingImage;
       setIsSendingImage(true);
@@ -752,6 +805,7 @@ export default function App() {
             second: '2-digit'
           }),
           isMine: true,
+          delivered: true,
           file: {
             fileName: imageToSend.fileName,
             filePath: savedPath || imageToSend.fileName,
@@ -766,14 +820,15 @@ export default function App() {
         setPendingImage(null);
       } catch (err) {
         console.error('Ekran görüntüsü gönderilemedi:', err);
-        alert('Ekran görüntüsü gönderilemedi. Backend send_clipboard_image komutunu kontrol edin.');
+        alert('Ekran görüntüsü gönderilemedi.');
       } finally {
         setIsSendingImage(false);
       }
     }
 
-    // 2. Metin kutusunda yazı varsa metni de gönder
-    const trimmed = inputText.trim();
+    // 2. Metin kutusunda yazı varsa gönder
+    const rawText = inputText;
+    const trimmed = rawText.trim();
     if (!trimmed) return;
 
     setInputText('');
@@ -783,26 +838,32 @@ export default function App() {
       return;
     }
 
-    const newMsg: ChatMessage = {
-      id: crypto.randomUUID(),
-      sender_id: 'me',
-      sender_name: username,
-      text: inputText,
-      timestamp: new Date().toLocaleTimeString([], {
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-      }),
-      isMine: true
-    };
-
-    setHistories((prev) => ({
-      ...prev,
-      [activeTabId]: [...(prev[activeTabId] || []), newMsg]
-    }));
-
     try {
-      await bridge.sendMessage(targetId, inputText);
+      const msgId = await bridge.sendMessage(targetId, rawText);
+      const resolvedId = msgId || crypto.randomUUID();
+      const alreadyAcked = pendingAcksRef.current.has(resolvedId);
+      if (alreadyAcked) {
+        pendingAcksRef.current.delete(resolvedId);
+      }
+
+      const newMsg: ChatMessage = {
+        id: resolvedId,
+        sender_id: 'me',
+        sender_name: username,
+        text: rawText,
+        timestamp: new Date().toLocaleTimeString([], {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit'
+        }),
+        isMine: true,
+        delivered: alreadyAcked
+      };
+
+      setHistories((prev) => ({
+        ...prev,
+        [activeTabId]: [...(prev[activeTabId] || []), newMsg]
+      }));
     } catch (err) {
       console.error('Mesaj gönderilemedi:', err);
     }
@@ -967,7 +1028,6 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             className="w-full max-w-4xl max-h-[88vh] bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl flex flex-col overflow-hidden"
           >
-            {/* Modal Üst Başlık */}
             <div className="px-5 py-3.5 border-b border-zinc-800 bg-zinc-950/70 flex items-center justify-between gap-4">
               <div className="flex items-center gap-3 min-w-0">
                 <div className="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center shrink-0">
@@ -1040,7 +1100,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Modal İçerik Alanı */}
             <div className="flex-1 overflow-auto p-6 bg-[#09090b] flex items-center justify-center select-text">
               {previewModal.loading && (
                 <div className="flex flex-col items-center gap-3 py-16 text-zinc-400">
@@ -1307,16 +1366,27 @@ export default function App() {
           })}
         </div>
 
-        {/* Üst Durum ve Oturum Barı */}
+        {/* Üst Durum, X25519 E2EE Rozeti ve Oturum Barı */}
         <header className="h-14 border-b border-zinc-800/80 px-6 bg-zinc-950/60 backdrop-blur-md flex items-center justify-between gap-4">
           <div className="min-w-0">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <span className="text-sm font-semibold text-zinc-100 truncate">
                 {activeTab.isGroup ? '# BROADCAST_ALL' : `@${activeTab.title}`}
               </span>
-              <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-zinc-900 border border-zinc-800 text-zinc-400">
+              <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-zinc-900 border border-zinc-800 text-zinc-400 font-mono">
                 {activeTab.isGroup ? 'Grup Ağı' : activePeer ? activePeer.ip : 'Özel Mesaj'}
               </span>
+
+              {/* DM Sekmelerinde X25519 E2EE Aktif Kilit Rozeti */}
+              {!activeTab.isGroup && (
+                <span
+                  title="X25519 Elliptic-Curve Diffie-Hellman Uçtan Uca Anahtar Değişimi Aktif"
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/25 text-emerald-400 shadow-sm"
+                >
+                  <Lock className="w-3 h-3 text-emerald-400" />
+                  <span>X25519 E2EE Aktif</span>
+                </span>
+              )}
             </div>
           </div>
 
@@ -1375,11 +1445,30 @@ export default function App() {
                 key={msg.id}
                 className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}
               >
-                <div className="flex items-center gap-2 mb-1 px-1 text-[11px] text-zinc-500">
+                {/* Gönderen, Saat ve Teslim Onayı (Tek Tik / Yeşil Çift Tik) */}
+                <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px] text-zinc-500">
                   {!msg.isMine && (
-                    <span className="font-medium text-zinc-300">{msg.sender_name}</span>
+                    <span className="font-medium text-zinc-300 mr-0.5">{msg.sender_name}</span>
                   )}
                   <span className="font-mono">{msg.timestamp}</span>
+                  {msg.isMine && (
+                    <span
+                      title={
+                        msg.delivered
+                          ? 'Teslim edildi'
+                          : 'Gönderildi (Teslim onayı bekleniyor)'
+                      }
+                      className={`inline-flex items-center ${
+                        msg.delivered ? 'text-emerald-400' : 'text-zinc-500'
+                      }`}
+                    >
+                      {msg.delivered ? (
+                        <CheckCheck className="w-3.5 h-3.5" />
+                      ) : (
+                        <Check className="w-3.5 h-3.5" />
+                      )}
+                    </span>
+                  )}
                 </div>
 
                 {msg.file ? (
@@ -1558,7 +1647,7 @@ export default function App() {
                   ? 'Ekran görüntüsünü göndermek için Enter’a basın...'
                   : activeTab.isGroup
                     ? 'Gruba mesaj yazın, ekran görüntüsü yapıştırın (Ctrl+V) veya /help deneyin...'
-                    : `@${activeTab.title} kullanıcısına özel mesaj yazın...`
+                    : `@${activeTab.title} kullanıcısına X25519 şifreli mesaj yazın...`
               }
               className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/10 transition-all"
             />
