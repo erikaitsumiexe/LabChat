@@ -1,7 +1,6 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
-// --- TİP TANIMLAMALARI ---
 export interface Peer {
   id: string;
   username: string;
@@ -10,53 +9,48 @@ export interface Peer {
 
 export interface ReceivedMessage {
   sender_id: string;
+  sender_name: string;
   text: string;
   timestamp: string;
+  is_private: boolean;
 }
 
 export interface ReceivedFile {
   sender_id: string;
+  sender_name: string;
   file_path: string;
   file_name: string;
+  timestamp: string;
+  is_private: boolean;
 }
 
-// --- KÖPRÜ (BRIDGE) OBJESİ ---
 export const bridge = {
-  // 1. Odaya Katılma
   joinRoom: async (username: string, roomPassword: string): Promise<void> => {
-    // Backend sözleşmesine uygun parametreler (roomPassword)
-    await invoke('join_room', { username, roomPassword });
+    await invoke("join_room", { username, roomPassword });
   },
 
-  // 2. Mesaj Gönderme (targetIp null ise herkese (broadcast) gider)
-  sendMessage: async (targetIp: string | null, text: string): Promise<void> => {
-    // Backend sözleşmesine uygun parametreler (targetIp)
-    await invoke('send_message', { targetIp, text });
+  sendMessage: async (targetId: string | null, text: string): Promise<void> => {
+    await invoke("send_message", { targetId, text });
   },
 
-  // 3. Dosya Gönderme
   sendFile: async (targetId: string | null, filePath: string): Promise<void> => {
-    // Backend sözleşmesine uygun parametreler (targetId, filePath)
-    await invoke('send_file', { targetId, filePath });
+    await invoke("send_file", { targetId, filePath });
   },
 
-  // 4. Ağdaki Peer'leri Dinleme
   onPeersUpdated: async (callback: (peers: Peer[]) => void): Promise<UnlistenFn> => {
-    return await listen<Peer[]>('peers-updated', (event) => {
+    return await listen<Peer[]>("peers-updated", (event) => {
       callback(event.payload);
     });
   },
 
-  // 5. Gelen Mesajları Dinleme
   onMessageReceived: async (callback: (msg: ReceivedMessage) => void): Promise<UnlistenFn> => {
-    return await listen<ReceivedMessage>('message-received', (event) => {
+    return await listen<ReceivedMessage>("message-received", (event) => {
       callback(event.payload);
     });
   },
 
-  // 6. Gelen Dosyaları Dinleme
   onFileReceived: async (callback: (file: ReceivedFile) => void): Promise<UnlistenFn> => {
-    return await listen<ReceivedFile>('file-received', (event) => {
+    return await listen<ReceivedFile>("file-received", (event) => {
       callback(event.payload);
     });
   }
