@@ -37,6 +37,10 @@ pub enum NetworkPacket {
         msg_id: String,
         sender_id: String,
     },
+    Read {
+        msg_ids: Vec<String>,
+        sender_id: String,
+    },
 }
 
 #[derive(Clone, Serialize)]
@@ -64,6 +68,135 @@ pub struct ReceivedFile {
 pub struct MessageAck {
     pub msg_id: String,
     pub sender_id: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct MessageRead {
+    pub msg_ids: Vec<String>,
+    pub sender_id: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct MessageStatus {
+    pub msg_id: String,
+    pub status: String, // "queued" | "sent"
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OutboxItem {
+    pub msg_id: String,
+    pub target_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub timestamp: String,
+    pub kind: String, // "text" | "file"
+    pub text: Option<String>,
+    pub file_path: Option<String>,
+}
+
+fn outbox_file_path() -> PathBuf {
+    let dir = std::env::temp_dir().join("labchat_state");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("outbox_queue.json")
+}
+
+pub async fn load_outbox() -> Vec<OutboxItem> {
+    if let Ok(bytes) = fs::read(outbox_file_path()).await {
+        if let Ok(items) = serde_json::from_slice::<Vec<OutboxItem>>(&bytes) {
+            return items;
+        }
+    }
+    Vec::new()
+}
+
+pub async fn save_outbox(items: &[OutboxItem]) {
+    if let Ok(json) = serde_json::to_vec_pretty(items) {
+        let _ = fs::write(outbox_file_path(), json).await;
+    }
+}
+
+pub async fn enqueue_outbox(outbox: &Arc<Mutex<Vec<OutboxItem>>>, item: OutboxItem) {
+    let mut list = outbox.lock().await;
+    list.push(item);
+    save_outbox(&list).await;
+}
+
+pub async fn flush_outbox_for_peer(
+    app: &AppHandle,
+    peer: &Peer,
+    room_key: [u8; 32],
+    session: &CryptoSession,
+    outbox: &Arc<Mutex<Vec<OutboxItem>>>,
+) {
+    let pending: Vec<OutboxItem> = {
+        let list = outbox.lock().await;
+        list.iter()
+            .filter(|i| i.target_id == peer.id || i.target_id == peer.ip)
+            .cloned()
+            .collect()
+    };
+
+    if pending.is_empty() {
+        return;
+    }
+
+    let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
+    let mut delivered_ids = Vec::new();
+
+    for item in pending {
+        let packet_opt = if item.kind == "text" {
+            item.text.map(|t| NetworkPacket::Text {
+                msg_id: item.msg_id.clone(),
+                sender_id: item.sender_id.clone(),
+                sender_name: item.sender_name.clone(),
+                text: t,
+                timestamp: item.timestamp.clone(),
+                is_private: true,
+            })
+        } else if let Some(fp) = &item.file_path {
+            if let Ok(data) = fs::read(fp).await {
+                let file_name = std::path::Path::new(fp)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("dosya")
+                    .to_string();
+                Some(NetworkPacket::File {
+                    msg_id: item.msg_id.clone(),
+                    sender_id: item.sender_id.clone(),
+                    sender_name: item.sender_name.clone(),
+                    file_name,
+                    data,
+                    timestamp: item.timestamp.clone(),
+                    is_private: true,
+                })
+            } else {
+                // Kaynak dosya silinmişse kuyruktan düşür
+                delivered_ids.push(item.msg_id.clone());
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(packet) = packet_opt {
+            if send_packet(&peer.ip, dm_key, &packet).await.is_ok() {
+                delivered_ids.push(item.msg_id.clone());
+                let _ = app.emit(
+                    "message-status",
+                    MessageStatus {
+                        msg_id: item.msg_id,
+                        status: "sent".to_string(),
+                    },
+                );
+            }
+        }
+    }
+
+    if !delivered_ids.is_empty() {
+        let mut list = outbox.lock().await;
+        list.retain(|i| !delivered_ids.contains(&i.msg_id));
+        save_outbox(&list).await;
+    }
 }
 
 pub fn current_time_str() -> String {
@@ -108,14 +241,15 @@ pub async fn start_tcp_server(
 
                         let mut encrypted_buf = vec![0u8; payload_len];
                         if socket.read_exact(&mut encrypted_buf).await.is_ok() {
-                            // 1. Önce Grup Anahtarı ile çözmeyi dene, olmazsa X25519 DM anahtarlarını dene
-                            let mut decrypted = crypto::decrypt(&room_key_clone, &encrypted_buf).ok();
+                            let mut decrypted =
+                                crypto::decrypt(&room_key_clone, &encrypted_buf).ok();
                             let mut used_key = room_key_clone;
 
                             if decrypted.is_none() {
                                 let p_map = peers_clone.lock().await;
                                 for peer in p_map.values() {
-                                    let dm_key = session_clone.compute_dm_key(&peer.public_key, &room_key_clone);
+                                    let dm_key = session_clone
+                                        .compute_dm_key(&peer.public_key, &room_key_clone);
                                     if let Ok(plain) = crypto::decrypt(&dm_key, &encrypted_buf) {
                                         decrypted = Some(plain);
                                         used_key = dm_key;
@@ -125,7 +259,9 @@ pub async fn start_tcp_server(
                             }
 
                             if let Some(decrypted_bytes) = decrypted {
-                                if let Ok(packet) = serde_json::from_slice::<NetworkPacket>(&decrypted_bytes) {
+                                if let Ok(packet) =
+                                    serde_json::from_slice::<NetworkPacket>(&decrypted_bytes)
+                                {
                                     match packet {
                                         NetworkPacket::Text {
                                             msg_id,
@@ -167,7 +303,9 @@ pub async fn start_tcp_server(
                                             timestamp,
                                             is_private,
                                         } => {
-                                            if let Ok(saved_path) = save_incoming_file(&file_name, &data).await {
+                                            if let Ok(saved_path) =
+                                                save_incoming_file(&file_name, &data).await
+                                            {
                                                 let sender_ip = {
                                                     let p_map = peers_clone.lock().await;
                                                     p_map.get(&sender_id).map(|p| p.ip.clone())
@@ -194,7 +332,16 @@ pub async fn start_tcp_server(
                                             }
                                         }
                                         NetworkPacket::Ack { msg_id, sender_id } => {
-                                            let _ = app_clone.emit("message-ack", MessageAck { msg_id, sender_id });
+                                            let _ = app_clone.emit(
+                                                "message-ack",
+                                                MessageAck { msg_id, sender_id },
+                                            );
+                                        }
+                                        NetworkPacket::Read { msg_ids, sender_id } => {
+                                            let _ = app_clone.emit(
+                                                "message-read",
+                                                MessageRead { msg_ids, sender_id },
+                                            );
                                         }
                                     }
                                 }

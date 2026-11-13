@@ -5,10 +5,10 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tokio::fs;
-use tokio::sync::Mutex;
-use transport::NetworkPacket;
+use tokio::sync::{mpsc, Mutex};
+use transport::{MessageStatus, NetworkPacket, OutboxItem};
 use uuid::Uuid;
 
 mod crypto;
@@ -21,6 +21,7 @@ struct AppState {
     room_key: Mutex<[u8; 32]>,
     crypto_session: Mutex<Option<CryptoSession>>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
+    outbox: Arc<Mutex<Vec<OutboxItem>>>,
     started: Mutex<bool>,
 }
 
@@ -32,12 +33,6 @@ pub struct FilePreviewResponse {
     pub file_size: u64,
 }
 
-#[derive(Serialize)]
-pub struct ClipboardSendResponse {
-    pub msg_id: String,
-    pub file_path: String,
-}
-
 #[tauri::command]
 async fn join_room(
     app: AppHandle,
@@ -45,7 +40,7 @@ async fn join_room(
     username: String,
     room_password: String,
 ) -> Result<(), String> {
-    println!("Backend: {} giriş yaptı. X25519 oturumu başlatılıyor...", username);
+    println!("Backend: {} giriş yaptı. X25519 ve Outbox başlatılıyor...", username);
 
     let mut started = state.started.lock().await;
     if *started {
@@ -63,12 +58,28 @@ async fn join_room(
     let pub_key_bytes = session.public_key.to_bytes();
     *state.crypto_session.lock().await = Some(session.clone());
 
+    let saved_outbox = transport::load_outbox().await;
+    *state.outbox.lock().await = saved_outbox;
+
+    let (online_tx, mut online_rx) = mpsc::unbounded_channel::<Peer>();
+    let app_flush = app.clone();
+    let session_flush = session.clone();
+    let outbox_flush = state.outbox.clone();
+
+    tokio::spawn(async move {
+        while let Some(peer) = online_rx.recv().await {
+            transport::flush_outbox_for_peer(&app_flush, &peer, key, &session_flush, &outbox_flush)
+                .await;
+        }
+    });
+
     discovery::start_discovery(
         app.clone(),
         my_id.clone(),
         username,
         pub_key_bytes,
         state.peers.clone(),
+        online_tx,
     )
     .await;
     transport::start_tcp_server(app, my_id, key, session, state.peers.clone()).await;
@@ -79,6 +90,7 @@ async fn join_room(
 
 #[tauri::command]
 async fn send_message(
+    app: AppHandle,
     state: State<'_, AppState>,
     target_id: Option<String>,
     text: String,
@@ -98,21 +110,61 @@ async fn send_message(
 
     match target_id {
         Some(target) => {
-            let peer = peers_map
+            let peer_opt = peers_map
                 .values()
                 .find(|p| p.id == target || p.ip == target)
-                .ok_or_else(|| "Hedef kullanıcı ağda bulunamadı!".to_string())?;
+                .cloned();
 
-            let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
-            let packet = NetworkPacket::Text {
-                msg_id: msg_id.clone(),
-                sender_id: my_id,
-                sender_name: my_username,
-                text,
-                timestamp,
-                is_private: true,
-            };
-            transport::send_packet(&peer.ip, dm_key, &packet).await?;
+            let mut delivered_now = false;
+            if let Some(ref peer) = peer_opt {
+                if peer.online {
+                    let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
+                    let packet = NetworkPacket::Text {
+                        msg_id: msg_id.clone(),
+                        sender_id: my_id.clone(),
+                        sender_name: my_username.clone(),
+                        text: text.clone(),
+                        timestamp: timestamp.clone(),
+                        is_private: true,
+                    };
+                    if transport::send_packet(&peer.ip, dm_key, &packet).await.is_ok() {
+                        delivered_now = true;
+                    }
+                }
+            }
+
+            if delivered_now {
+                let _ = app.emit(
+                    "message-status",
+                    MessageStatus {
+                        msg_id: msg_id.clone(),
+                        status: "sent".to_string(),
+                    },
+                );
+            } else {
+                let real_target_id = peer_opt.map(|p| p.id).unwrap_or(target);
+                transport::enqueue_outbox(
+                    &state.outbox,
+                    OutboxItem {
+                        msg_id: msg_id.clone(),
+                        target_id: real_target_id,
+                        sender_id: my_id,
+                        sender_name: my_username,
+                        timestamp,
+                        kind: "text".to_string(),
+                        text: Some(text),
+                        file_path: None,
+                    },
+                )
+                .await;
+                let _ = app.emit(
+                    "message-status",
+                    MessageStatus {
+                        msg_id: msg_id.clone(),
+                        status: "queued".to_string(),
+                    },
+                );
+            }
         }
         None => {
             let packet = NetworkPacket::Text {
@@ -123,9 +175,16 @@ async fn send_message(
                 timestamp,
                 is_private: false,
             };
-            for peer in peers_map.values() {
+            for peer in peers_map.values().filter(|p| p.online) {
                 let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
+            let _ = app.emit(
+                "message-status",
+                MessageStatus {
+                    msg_id: msg_id.clone(),
+                    status: "sent".to_string(),
+                },
+            );
         }
     }
 
@@ -133,6 +192,7 @@ async fn send_message(
 }
 
 async fn send_file_internal(
+    app: &AppHandle,
     state: &AppState,
     target_id: Option<String>,
     file_path: &str,
@@ -162,22 +222,62 @@ async fn send_file_internal(
 
     match target_id {
         Some(target) => {
-            let peer = peers_map
+            let peer_opt = peers_map
                 .values()
                 .find(|p| p.id == target || p.ip == target)
-                .ok_or_else(|| "Hedef kullanıcı ağda bulunamadı!".to_string())?;
+                .cloned();
 
-            let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
-            let packet = NetworkPacket::File {
-                msg_id: msg_id.clone(),
-                sender_id: my_id,
-                sender_name: my_username,
-                file_name,
-                data,
-                timestamp,
-                is_private: true,
-            };
-            transport::send_packet(&peer.ip, dm_key, &packet).await?;
+            let mut delivered_now = false;
+            if let Some(ref peer) = peer_opt {
+                if peer.online {
+                    let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
+                    let packet = NetworkPacket::File {
+                        msg_id: msg_id.clone(),
+                        sender_id: my_id.clone(),
+                        sender_name: my_username.clone(),
+                        file_name,
+                        data,
+                        timestamp: timestamp.clone(),
+                        is_private: true,
+                    };
+                    if transport::send_packet(&peer.ip, dm_key, &packet).await.is_ok() {
+                        delivered_now = true;
+                    }
+                }
+            }
+
+            if delivered_now {
+                let _ = app.emit(
+                    "message-status",
+                    MessageStatus {
+                        msg_id: msg_id.clone(),
+                        status: "sent".to_string(),
+                    },
+                );
+            } else {
+                let real_target_id = peer_opt.map(|p| p.id).unwrap_or(target);
+                transport::enqueue_outbox(
+                    &state.outbox,
+                    OutboxItem {
+                        msg_id: msg_id.clone(),
+                        target_id: real_target_id,
+                        sender_id: my_id,
+                        sender_name: my_username,
+                        timestamp,
+                        kind: "file".to_string(),
+                        text: None,
+                        file_path: Some(file_path.to_string()),
+                    },
+                )
+                .await;
+                let _ = app.emit(
+                    "message-status",
+                    MessageStatus {
+                        msg_id: msg_id.clone(),
+                        status: "queued".to_string(),
+                    },
+                );
+            }
         }
         None => {
             let packet = NetworkPacket::File {
@@ -189,9 +289,16 @@ async fn send_file_internal(
                 timestamp,
                 is_private: false,
             };
-            for peer in peers_map.values() {
+            for peer in peers_map.values().filter(|p| p.online) {
                 let _ = transport::send_packet(&peer.ip, room_key, &packet).await;
             }
+            let _ = app.emit(
+                "message-status",
+                MessageStatus {
+                    msg_id: msg_id.clone(),
+                    status: "sent".to_string(),
+                },
+            );
         }
     }
 
@@ -200,11 +307,49 @@ async fn send_file_internal(
 
 #[tauri::command]
 async fn send_file(
+    app: AppHandle,
     state: State<'_, AppState>,
     target_id: Option<String>,
     file_path: String,
 ) -> Result<String, String> {
-    send_file_internal(&state, target_id, &file_path).await
+    send_file_internal(&app, &state, target_id, &file_path).await
+}
+
+#[tauri::command]
+async fn mark_as_read(
+    state: State<'_, AppState>,
+    peer_id: String,
+    msg_ids: Vec<String>,
+) -> Result<(), String> {
+    if msg_ids.is_empty() {
+        return Ok(());
+    }
+
+    let my_id = state.my_id.lock().await.clone();
+    let room_key = *state.room_key.lock().await;
+    let session = state
+        .crypto_session
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "Oturum henüz başlatılmadı!".to_string())?;
+    let peers_map = state.peers.lock().await.clone();
+
+    if let Some(peer) = peers_map
+        .values()
+        .find(|p| p.id == peer_id || p.ip == peer_id)
+    {
+        if peer.online {
+            let dm_key = session.compute_dm_key(&peer.public_key, &room_key);
+            let packet = NetworkPacket::Read {
+                msg_ids,
+                sender_id: my_id,
+            };
+            let _ = transport::send_packet(&peer.ip, dm_key, &packet).await;
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -283,6 +428,7 @@ async fn read_file_preview(file_path: String) -> Result<FilePreviewResponse, Str
 
 #[tauri::command]
 async fn send_clipboard_image(
+    app: AppHandle,
     state: State<'_, AppState>,
     target_id: Option<String>,
     file_name: String,
@@ -314,7 +460,7 @@ async fn send_clipboard_image(
         .map_err(|e| format!("Görsel diske yazılamadı: {}", e))?;
 
     let saved_path_str = saved_path.to_string_lossy().to_string();
-    let _msg_id = send_file_internal(&state, target_id, &saved_path_str).await?;
+    let _msg_id = send_file_internal(&app, &state, target_id, &saved_path_str).await?;
 
     Ok(saved_path_str)
 }
@@ -330,12 +476,14 @@ pub fn run() {
             room_key: Mutex::new([0u8; 32]),
             crypto_session: Mutex::new(None),
             peers: Arc::new(Mutex::new(HashMap::new())),
+            outbox: Arc::new(Mutex::new(Vec::new())),
             started: Mutex::new(false),
         })
         .invoke_handler(tauri::generate_handler![
             join_room,
             send_message,
             send_file,
+            mark_as_read,
             read_file_preview,
             send_clipboard_image
         ])

@@ -6,6 +6,7 @@ export interface Peer {
   username: string;
   ip: string;
   public_key?: number[];
+  online?: boolean;
 }
 
 export interface ReceivedMessage {
@@ -32,6 +33,16 @@ export interface MessageAck {
   sender_id: string;
 }
 
+export interface MessageRead {
+  msg_ids: string[];
+  sender_id: string;
+}
+
+export interface MessageStatus {
+  msg_id: string;
+  status: "queued" | "sent" | string;
+}
+
 export interface FilePreviewResponse {
   file_type: "image" | "text" | string;
   mime_type: string;
@@ -50,6 +61,10 @@ export const bridge = {
 
   sendFile: async (targetId: string | null, filePath: string): Promise<string> => {
     return await invoke<string>("send_file", { targetId, filePath });
+  },
+
+  markAsRead: async (peerId: string, msgIds: string[]): Promise<void> => {
+    await invoke("mark_as_read", { peerId, msgIds });
   },
 
   readFilePreview: async (filePath: string): Promise<FilePreviewResponse> => {
@@ -88,6 +103,18 @@ export const bridge = {
 
   onMessageAck: async (callback: (ack: MessageAck) => void): Promise<UnlistenFn> => {
     return await listen<MessageAck>("message-ack", (event) => {
+      callback(event.payload);
+    });
+  },
+
+  onMessageRead: async (callback: (read: MessageRead) => void): Promise<UnlistenFn> => {
+    return await listen<MessageRead>("message-read", (event) => {
+      callback(event.payload);
+    });
+  },
+
+  onMessageStatus: async (callback: (st: MessageStatus) => void): Promise<UnlistenFn> => {
+    return await listen<MessageStatus>("message-status", (event) => {
       callback(event.payload);
     });
   }

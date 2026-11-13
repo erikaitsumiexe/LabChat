@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
+use tokio::fs;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, Duration};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -12,6 +15,10 @@ pub struct Peer {
     pub username: String,
     pub ip: String,
     pub public_key: [u8; 32],
+    #[serde(default)]
+    pub online: bool,
+    #[serde(default)]
+    pub last_seen: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -23,13 +30,58 @@ struct AnnouncePacket {
 
 const DISCOVERY_PORT: u16 = 54321;
 
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn peers_file_path() -> PathBuf {
+    let dir = std::env::temp_dir().join("labchat_state");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("known_peers.json")
+}
+
+pub async fn load_known_peers() -> HashMap<String, Peer> {
+    let path = peers_file_path();
+    if let Ok(bytes) = fs::read(path).await {
+        if let Ok(mut map) = serde_json::from_slice::<HashMap<String, Peer>>(&bytes) {
+            for peer in map.values_mut() {
+                peer.online = false;
+            }
+            return map;
+        }
+    }
+    HashMap::new()
+}
+
+async fn save_known_peers(peers: &HashMap<String, Peer>) {
+    if let Ok(json) = serde_json::to_vec_pretty(peers) {
+        let _ = fs::write(peers_file_path(), json).await;
+    }
+}
+
 pub async fn start_discovery(
     app: AppHandle,
     my_id: String,
     my_username: String,
     my_public_key: [u8; 32],
     peers: Arc<Mutex<HashMap<String, Peer>>>,
+    online_tx: mpsc::UnboundedSender<Peer>,
 ) {
+    let initial_peers = load_known_peers().await;
+    if !initial_peers.is_empty() {
+        let mut p_map = peers.lock().await;
+        for (k, v) in initial_peers {
+            if k != my_id {
+                p_map.insert(k, v);
+            }
+        }
+        let peer_list: Vec<Peer> = p_map.values().cloned().collect();
+        let _ = app.emit("peers-updated", peer_list);
+    }
+
     let listen_socket = UdpSocket::bind(format!("0.0.0.0:{}", DISCOVERY_PORT))
         .await
         .expect("UDP Keşif portu (54321) dolu!");
@@ -52,28 +104,38 @@ pub async fn start_discovery(
                     if packet.id != my_id_clone {
                         let mut p_map = peers_clone.lock().await;
                         let peer_ip = addr.ip().to_string();
-                        let should_emit = match p_map.get(&packet.id) {
+                        let current_ts = now_secs();
+
+                        let (should_emit, became_online) = match p_map.get(&packet.id) {
                             Some(existing) => {
-                                existing.username != packet.username
+                                let changed = existing.username != packet.username
                                     || existing.ip != peer_ip
                                     || existing.public_key != packet.public_key
+                                    || !existing.online;
+                                (changed, !existing.online)
                             }
-                            None => true,
+                            None => (true, true),
                         };
 
-                        p_map.insert(
-                            packet.id.clone(),
-                            Peer {
-                                id: packet.id,
-                                username: packet.username,
-                                ip: peer_ip,
-                                public_key: packet.public_key,
-                            },
-                        );
+                        let peer_obj = Peer {
+                            id: packet.id.clone(),
+                            username: packet.username,
+                            ip: peer_ip,
+                            public_key: packet.public_key,
+                            online: true,
+                            last_seen: current_ts,
+                        };
+
+                        p_map.insert(packet.id, peer_obj.clone());
 
                         if should_emit {
                             let peer_list: Vec<Peer> = p_map.values().cloned().collect();
                             let _ = app_clone.emit("peers-updated", peer_list);
+                            save_known_peers(&p_map).await;
+                        }
+
+                        if became_online {
+                            let _ = online_tx.send(peer_obj);
                         }
                     }
                 }
@@ -81,6 +143,32 @@ pub async fn start_discovery(
         }
     });
 
+    // Çevrimdışı olan kullanıcıları tespit eden bekçi görev
+    let peers_watchdog = peers.clone();
+    let app_watchdog = app.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(4)).await;
+            let current_ts = now_secs();
+            let mut p_map = peers_watchdog.lock().await;
+            let mut changed = false;
+
+            for peer in p_map.values_mut() {
+                if peer.online && current_ts.saturating_sub(peer.last_seen) > 10 {
+                    peer.online = false;
+                    changed = true;
+                }
+            }
+
+            if changed {
+                let peer_list: Vec<Peer> = p_map.values().cloned().collect();
+                let _ = app_watchdog.emit("peers-updated", peer_list);
+                save_known_peers(&p_map).await;
+            }
+        }
+    });
+
+    // Kendi varlığımızı ağa duyuran yayın döngüsü
     tokio::spawn(async move {
         let announce = AnnouncePacket {
             id: my_id,
