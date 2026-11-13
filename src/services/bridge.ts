@@ -24,6 +24,13 @@ export interface ReceivedFile {
   is_private: boolean;
 }
 
+export interface FilePreviewResponse {
+  file_type: "image" | "text" | string;
+  mime_type: string;
+  content: string;
+  file_size: number;
+}
+
 export const bridge = {
   joinRoom: async (username: string, roomPassword: string): Promise<void> => {
     await invoke("join_room", { username, roomPassword });
@@ -35,6 +42,22 @@ export const bridge = {
 
   sendFile: async (targetId: string | null, filePath: string): Promise<void> => {
     await invoke("send_file", { targetId, filePath });
+  },
+
+  readFilePreview: async (filePath: string): Promise<FilePreviewResponse> => {
+    return await invoke<FilePreviewResponse>("read_file_preview", { filePath });
+  },
+
+  sendClipboardImage: async (
+    targetId: string | null,
+    fileName: string,
+    base64Data: string
+  ): Promise<string> => {
+    return await invoke<string>("send_clipboard_image", {
+      targetId,
+      fileName,
+      base64Data,
+    });
   },
 
   onPeersUpdated: async (callback: (peers: Peer[]) => void): Promise<UnlistenFn> => {
