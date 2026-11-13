@@ -5,11 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tauri::{
-    menu::{Menu, MenuItem},
-    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State, WindowEvent,
-};
+use tauri::{AppHandle, Emitter, State};
 use tokio::fs;
 use tokio::sync::{mpsc, Mutex};
 use transport::{MessageStatus, NetworkPacket, OutboxItem};
@@ -626,59 +622,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
-        .setup(|app| {
-            let show_item = MenuItem::with_id(app, "show", "LabChat'i Aç", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Çıkış", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-
-            let mut tray_builder = TrayIconBuilder::with_id("labchat-tray")
-                .menu(&menu)
-                .tooltip("LabChat - Uçtan Uca Şifreli Ağ Sohbeti")
-                .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.unminimize();
-                            let _ = window.show();
-                            let _ = window.set_focus();
-                        }
-                    }
-                });
-
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
-
-            tray_builder.build(app)?;
-            Ok(())
-        })
-        .on_window_event(|window, event| {
-            if window.label() == "main" {
-                if let WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = window.hide();
-                }
-            }
-        })
         .manage(AppState {
             my_id: Mutex::new(String::new()),
             my_username: Mutex::new(String::new()),
