@@ -8,6 +8,7 @@ import {
 } from 'react';
 import {
   Shield,
+  ShieldAlert,
   Users,
   Send,
   Paperclip,
@@ -34,7 +35,14 @@ import {
   ZoomOut,
   Loader2,
   AlertCircle,
-  Image as ImageIcon
+  Image as ImageIcon,
+  MoreVertical,
+  BellOff,
+  Bell,
+  Trash2,
+  Ban,
+  VolumeX,
+  Volume2
 } from 'lucide-react';
 import { UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -42,6 +50,24 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { bridge, Peer, FilePreviewResponse } from './services/bridge';
 
 type MessageDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'read';
+
+interface ExtendedPeer extends Peer {
+  is_muted?: boolean;
+}
+
+interface AdminNoticePayload {
+  action: 'ban' | 'mute' | 'unmute';
+  is_self?: boolean;
+  target_id?: string;
+  target_name?: string;
+  reason?: string;
+}
+
+interface PeerContextMenuState {
+  peer: ExtendedPeer;
+  x: number;
+  y: number;
+}
 
 interface ChatTab {
   id: string;
@@ -197,7 +223,7 @@ export default function App() {
   const [uptimeSeconds, setUptimeSeconds] = useState(0);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  const [peers, setPeers] = useState<Peer[]>([]);
+  const [peers, setPeers] = useState<ExtendedPeer[]>([]);
   const [tabs, setTabs] = useState<ChatTab[]>([
     { id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }
   ]);
@@ -219,6 +245,18 @@ export default function App() {
   const [previewModal, setPreviewModal] = useState<PreviewModalState | null>(null);
   const [imageZoomed, setImageZoomed] = useState(false);
 
+  // Ağdaki Cihazlar Üç Nokta / Sağ Tık Menüsü State'i
+  const [peerMenu, setPeerMenu] = useState<PeerContextMenuState | null>(null);
+
+  // Admin Paneli ve Moderasyon State'leri
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
+  const [adminPasswordInput, setAdminPasswordInput] = useState('');
+  const [verifiedAdminPassword, setVerifiedAdminPassword] = useState<string | null>(null);
+  const [adminAuthError, setAdminAuthError] = useState<string | null>(null);
+  const [isVerifyingAdmin, setIsVerifyingAdmin] = useState(false);
+  const [moderatingPeerId, setModeratingPeerId] = useState<string | null>(null);
+  const [isSelfMuted, setIsSelfMuted] = useState(false);
+
   const activeTabRef = useRef<string>(GROUP_TAB_ID);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
@@ -236,6 +274,15 @@ export default function App() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [histories, activeTabId]);
+
+  // --- AÇIK KİŞİ MENÜSÜNÜ DIŞARI TIKLANINCA KAPAT ---
+  useEffect(() => {
+    if (!peerMenu) return;
+
+    const handleGlobalClick = () => setPeerMenu(null);
+    window.addEventListener('click', handleGlobalClick);
+    return () => window.removeEventListener('click', handleGlobalClick);
+  }, [peerMenu]);
 
   // --- AKTİF DM SEKMESİNDE OKUNMAMIŞ MESAJLAR İÇİN MARK_AS_READ TETİKLEYİCİSİ ---
   useEffect(() => {
@@ -287,7 +334,11 @@ export default function App() {
         setPaletteQuery('');
         setSelectedIndex(0);
       } else if (e.key === 'Escape') {
-        if (previewModal) {
+        if (peerMenu) {
+          setPeerMenu(null);
+        } else if (isAdminModalOpen) {
+          setIsAdminModalOpen(false);
+        } else if (previewModal) {
           setPreviewModal(null);
         } else if (isPaletteOpen) {
           setIsPaletteOpen(false);
@@ -299,7 +350,7 @@ export default function App() {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isLoggedIn, previewModal, isPaletteOpen, pendingImage]);
+  }, [isLoggedIn, peerMenu, isAdminModalOpen, previewModal, isPaletteOpen, pendingImage]);
 
   useEffect(() => {
     if (isPaletteOpen) {
@@ -346,7 +397,7 @@ export default function App() {
     if (!isLoggedIn) return;
 
     const handleGlobalPaste = (e: ClipboardEvent) => {
-      if (isPaletteOpen || previewModal) return;
+      if (isPaletteOpen || previewModal || isAdminModalOpen) return;
       const handled = processClipboardItems(e.clipboardData?.items);
       if (handled) {
         e.preventDefault();
@@ -355,7 +406,7 @@ export default function App() {
 
     window.addEventListener('paste', handleGlobalPaste);
     return () => window.removeEventListener('paste', handleGlobalPaste);
-  }, [isLoggedIn, isPaletteOpen, previewModal]);
+  }, [isLoggedIn, isPaletteOpen, previewModal, isAdminModalOpen]);
 
   // --- MASAÜSTÜ BİLDİRİM YARDIMCISI ---
   const triggerDesktopNotification = (title: string, body: string, targetTabId: string) => {
@@ -461,7 +512,7 @@ export default function App() {
     };
   }, [isLoggedIn, username]);
 
-  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, STATUS, ACK, READ) ---
+  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, STATUS, ACK, READ, ADMIN NOTICE) ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -471,6 +522,7 @@ export default function App() {
     let unlistenStatus: UnlistenFn | undefined;
     let unlistenAck: UnlistenFn | undefined;
     let unlistenRead: UnlistenFn | undefined;
+    let unlistenAdminNotice: UnlistenFn | undefined;
 
     const applyStatusUpdates = (updates: Array<{ msgId: string; status: MessageDeliveryStatus }>) => {
       if (updates.length === 0) return;
@@ -552,7 +604,7 @@ export default function App() {
     const setupListeners = async () => {
       try {
         unlistenPeers = await bridge.onPeersUpdated((updatedPeers) => {
-          setPeers(updatedPeers);
+          setPeers(updatedPeers as ExtendedPeer[]);
           setTabs((prevTabs) =>
             prevTabs.map((tab) => {
               if (tab.isGroup) return tab;
@@ -652,6 +704,26 @@ export default function App() {
             payload.msg_ids.map((id) => ({ msgId: id, status: 'read' as const }))
           );
         });
+
+        if (typeof bridge.onAdminNotice === 'function') {
+          unlistenAdminNotice = await bridge.onAdminNotice((rawNotice) => {
+            const notice = rawNotice as unknown as AdminNoticePayload;
+            if (!notice) return;
+
+            if (notice.is_self) {
+              if (notice.action === 'ban') {
+                alert('Admin tarafından odadan yasaklandınız');
+                handleDisconnect();
+                return;
+              }
+              if (notice.action === 'mute') {
+                setIsSelfMuted(true);
+              } else if (notice.action === 'unmute') {
+                setIsSelfMuted(false);
+              }
+            }
+          });
+        }
       } catch (error) {
         console.error('Listener başlatılırken hata oluştu:', error);
       }
@@ -666,8 +738,129 @@ export default function App() {
       if (unlistenStatus) unlistenStatus();
       if (unlistenAck) unlistenAck();
       if (unlistenRead) unlistenRead();
+      if (unlistenAdminNotice) unlistenAdminNotice();
     };
   }, [isLoggedIn]);
+
+  // --- KİŞİ YÖNETİMİ AKSİYONLARI (SUSTUR / SİL) ---
+  const handleOpenPeerMenu = (e: MouseEvent, peer: ExtendedPeer) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const menuWidth = 208;
+    const menuHeight = 104;
+    const x = Math.min(e.clientX, window.innerWidth - menuWidth - 12);
+    const y = Math.min(e.clientY, window.innerHeight - menuHeight - 12);
+
+    setPeerMenu({ peer, x, y });
+  };
+
+  const handleTogglePeerMute = async (peer: ExtendedPeer) => {
+    const nextMuted = !peer.is_muted;
+    setPeerMenu(null);
+
+    try {
+      await bridge.setPeerMuted(peer.id, nextMuted);
+      setPeers((prev) =>
+        prev.map((p) => (p.id === peer.id ? { ...p, is_muted: nextMuted } : p))
+      );
+    } catch (err) {
+      console.error('Susturma durumu güncellenemedi:', err);
+      alert('Kullanıcı susturma durumu değiştirilemedi.');
+    }
+  };
+
+  const handleRemovePeer = async (peer: ExtendedPeer) => {
+    setPeerMenu(null);
+
+    try {
+      await bridge.removePeer(peer.id);
+
+      setPeers((prev) => prev.filter((p) => p.id !== peer.id));
+      setHistories((prev) => {
+        const next = { ...prev };
+        delete next[peer.id];
+        return next;
+      });
+      setTabs((prev) => prev.filter((t) => t.id !== peer.id));
+
+      if (activeTabId === peer.id) {
+        setActiveTabId(GROUP_TAB_ID);
+        setTabs((prev) =>
+          prev.map((t) => (t.id === GROUP_TAB_ID ? { ...t, hasUnread: false } : t))
+        );
+      }
+    } catch (err) {
+      console.error('Kişi ve sohbet silinemedi:', err);
+      alert('Kişi silinirken bir hata oluştu.');
+    }
+  };
+
+  // --- ADMIN PANELİ AKSİYONLARI ---
+  const handleOpenAdminModal = () => {
+    setAdminAuthError(null);
+    setAdminPasswordInput('');
+    setIsAdminModalOpen(true);
+  };
+
+  const handleVerifyAdmin = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!adminPasswordInput.trim() || isVerifyingAdmin) return;
+
+    setIsVerifyingAdmin(true);
+    setAdminAuthError(null);
+
+    try {
+      const isValid = await bridge.verifyAdminPassword(adminPasswordInput);
+      if (isValid) {
+        setVerifiedAdminPassword(adminPasswordInput);
+        setAdminPasswordInput('');
+      } else {
+        setAdminAuthError('Hatalı admin şifresi. Lütfen tekrar deneyin.');
+      }
+    } catch (err) {
+      setAdminAuthError(
+        typeof err === 'string' ? err : 'Admin şifresi doğrulanırken hata oluştu.'
+      );
+    } finally {
+      setIsVerifyingAdmin(false);
+    }
+  };
+
+  const handleAdminModerate = async (
+    targetPeer: ExtendedPeer,
+    action: 'mute' | 'unmute' | 'ban'
+  ) => {
+    if (!verifiedAdminPassword || moderatingPeerId) return;
+
+    setModeratingPeerId(targetPeer.id);
+    try {
+      await bridge.adminModerateUser(verifiedAdminPassword, targetPeer.id, action);
+
+      if (action === 'ban') {
+        setPeers((prev) => prev.filter((p) => p.id !== targetPeer.id));
+        setTabs((prev) => prev.filter((t) => t.id !== targetPeer.id));
+        setHistories((prev) => {
+          const next = { ...prev };
+          delete next[targetPeer.id];
+          return next;
+        });
+        if (activeTabId === targetPeer.id) {
+          setActiveTabId(GROUP_TAB_ID);
+        }
+      } else {
+        const nextMuted = action === 'mute';
+        setPeers((prev) =>
+          prev.map((p) => (p.id === targetPeer.id ? { ...p, is_muted: nextMuted } : p))
+        );
+      }
+    } catch (err) {
+      console.error('Admin moderasyon işlemi başarısız:', err);
+      alert(typeof err === 'string' ? err : 'Moderasyon işlemi uygulanamadı.');
+    } finally {
+      setModeratingPeerId(null);
+    }
+  };
 
   // --- DOSYA ÖNİZLEME / OKUYUCU AÇMA ---
   const handleOpenFilePreview = async (file: FileAttachment) => {
@@ -737,6 +930,8 @@ export default function App() {
       await bridge.joinRoom(username, roomPassword);
       earlyStatusMapRef.current.clear();
       sentReadReceiptsRef.current.clear();
+      setIsSelfMuted(false);
+      setVerifiedAdminPassword(null);
       setIsLoggedIn(true);
       setActiveTabId(GROUP_TAB_ID);
       setTabs([{ id: GROUP_TAB_ID, title: 'Genel Kanal', isGroup: true, hasUnread: false }]);
@@ -769,6 +964,11 @@ export default function App() {
     setIsDragging(false);
     setPendingImage(null);
     setPreviewModal(null);
+    setPeerMenu(null);
+    setIsAdminModalOpen(false);
+    setVerifiedAdminPassword(null);
+    setAdminPasswordInput('');
+    setIsSelfMuted(false);
     earlyStatusMapRef.current.clear();
     sentReadReceiptsRef.current.clear();
     setPeers([]);
@@ -786,7 +986,7 @@ export default function App() {
     );
   };
 
-  const handleOpenDmTab = (peer: Peer) => {
+  const handleOpenDmTab = (peer: ExtendedPeer) => {
     setTabs((prev) => {
       const exists = prev.some((t) => t.id === peer.id);
       if (exists) {
@@ -1102,6 +1302,13 @@ export default function App() {
       onSelect: () => handleOpenDmTab(p)
     })),
     {
+      id: 'cmd-admin',
+      label: 'Admin Paneli — Moderasyon Yönetimi',
+      sublabel: 'Ban ve Mute işlemlerini yönet',
+      category: 'Komutlar',
+      onSelect: () => handleOpenAdminModal()
+    },
+    {
       id: 'cmd-attach',
       label: 'Dosya Gönder...',
       sublabel: 'Aktif kanala dosya seçip gönder',
@@ -1159,6 +1366,233 @@ export default function App() {
   // --- EKRAN 2: MODERN SEKMELİ SOHBET ARAYÜZÜ ---
   return (
     <div className="flex h-screen w-screen bg-[#09090b] text-zinc-100 font-sans select-none relative">
+      {/* AĞDAKİ CİHAZLAR ÜÇ NOKTA / SAĞ TIK AÇILIR MENÜSÜ */}
+      {peerMenu && (
+        <div
+          onClick={(e) => e.stopPropagation()}
+          style={{ top: peerMenu.y, left: peerMenu.x }}
+          className="fixed z-50 w-52 bg-zinc-900/95 backdrop-blur-xl border border-zinc-800 rounded-xl shadow-2xl p-1.5 space-y-1"
+        >
+          <div className="px-2.5 py-1 text-[11px] font-medium text-zinc-500 border-b border-zinc-800/80 truncate">
+            @{peerMenu.peer.username}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => handleTogglePeerMute(peerMenu.peer)}
+            className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-xs text-zinc-200 hover:bg-zinc-800 transition-colors text-left"
+          >
+            {peerMenu.peer.is_muted ? (
+              <>
+                <Bell className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>Sesi Aç</span>
+              </>
+            ) : (
+              <>
+                <BellOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span>Sustur</span>
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => handleRemovePeer(peerMenu.peer)}
+            className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-xs text-rose-400 hover:bg-rose-500/15 transition-colors text-left"
+          >
+            <Trash2 className="w-3.5 h-3.5 shrink-0" />
+            <span>Sohbeti ve Kişiyi Sil</span>
+          </button>
+        </div>
+      )}
+
+      {/* ADMIN PANELİ MODALI */}
+      {isAdminModalOpen && (
+        <div
+          onClick={() => setIsAdminModalOpen(false)}
+          className="fixed inset-0 z-50 bg-black/75 backdrop-blur-md flex items-center justify-center p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+          >
+            {/* Modal Üst Başlık */}
+            <div className="px-5 py-4 border-b border-zinc-800 bg-zinc-950/70 flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center">
+                  <ShieldAlert className="w-4 h-4 text-amber-400" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-zinc-100">Admin Moderasyon Paneli</h3>
+                  <p className="text-[11px] text-zinc-400">
+                    {verifiedAdminPassword
+                      ? 'Ağdaki aktif kullanıcıları susturabilir veya odadan yasaklayabilirsiniz'
+                      : 'Devam etmek için yönetici parolasını doğrulayın'}
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => setIsAdminModalOpen(false)}
+                className="p-1.5 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-white transition-colors"
+                title="Kapat (ESC)"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal İçerik */}
+            {!verifiedAdminPassword ? (
+              <form onSubmit={handleVerifyAdmin} className="p-6 space-y-4">
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-zinc-400 flex items-center gap-1.5">
+                    <Lock className="w-3.5 h-3.5 text-amber-400" /> Admin Şifresi
+                  </label>
+                  <input
+                    type="password"
+                    autoFocus
+                    value={adminPasswordInput}
+                    onChange={(e) => {
+                      setAdminPasswordInput(e.target.value);
+                      if (adminAuthError) setAdminAuthError(null);
+                    }}
+                    placeholder="Yönetici şifresini girin..."
+                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-600 focus:outline-none focus:border-amber-500/60 focus:ring-2 focus:ring-amber-500/15 transition-all tracking-widest"
+                    required
+                  />
+                </div>
+
+                {adminAuthError && (
+                  <div className="flex items-center gap-2 px-3 py-2.5 rounded-xl bg-rose-500/10 border border-rose-500/25 text-xs text-rose-300">
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                    <span>{adminAuthError}</span>
+                  </div>
+                )}
+
+                <div className="flex items-center justify-end gap-2 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsAdminModalOpen(false)}
+                    className="px-4 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-300 transition-colors"
+                  >
+                    Vazgeç
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isVerifyingAdmin}
+                    className="px-5 py-2.5 rounded-xl bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-zinc-950 font-semibold text-xs flex items-center gap-2 transition-colors"
+                  >
+                    {isVerifyingAdmin && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                    <span>Paneli Aç</span>
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="p-5 space-y-3 max-h-[65vh] overflow-y-auto">
+                <div className="flex items-center justify-between text-xs text-zinc-400 px-1">
+                  <span>Aktif Ağ Kullanıcıları ({peers.length})</span>
+                  <button
+                    type="button"
+                    onClick={() => setVerifiedAdminPassword(null)}
+                    className="text-[11px] text-zinc-500 hover:text-zinc-300 underline"
+                  >
+                    Oturumu Kilitle
+                  </button>
+                </div>
+
+                {peers.length === 0 ? (
+                  <div className="py-10 text-center text-xs text-zinc-500 bg-zinc-950/60 rounded-xl border border-zinc-800/80">
+                    Şu anda ağda moderasyon uygulanabilecek başka kullanıcı yok
+                  </div>
+                ) : (
+                  <ul className="space-y-2">
+                    {peers.map((peer) => {
+                      const isMuted = Boolean(peer.is_muted);
+                      const isBusy = moderatingPeerId === peer.id;
+
+                      return (
+                        <li
+                          key={peer.id}
+                          className="p-3 rounded-xl bg-zinc-950/80 border border-zinc-800/90 flex items-center justify-between gap-3"
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className="relative shrink-0">
+                              <div className="w-9 h-9 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center text-xs font-semibold uppercase text-zinc-200">
+                                {peer.username.slice(0, 2)}
+                              </div>
+                              <span
+                                className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-zinc-950 ${
+                                  peer.online ? 'bg-emerald-400' : 'bg-zinc-500'
+                                }`}
+                              />
+                            </div>
+
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-1.5">
+                                <span className="text-sm font-medium text-zinc-100 truncate">
+                                  {peer.username}
+                                </span>
+                                {isMuted && (
+                                  <span className="inline-flex items-center gap-1 text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
+                                    <VolumeX className="w-2.5 h-2.5" />
+                                    Susturuldu
+                                  </span>
+                                )}
+                              </div>
+                              <div className="text-[11px] font-mono text-zinc-500 truncate">
+                                {peer.ip} • {peer.online ? 'Çevrimiçi' : 'Çevrimdışı'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() =>
+                                handleAdminModerate(peer, isMuted ? 'unmute' : 'mute')
+                              }
+                              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors disabled:opacity-50 ${
+                                isMuted
+                                  ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/30 text-emerald-300'
+                                  : 'bg-amber-500/15 hover:bg-amber-500/25 border-amber-500/30 text-amber-300'
+                              }`}
+                            >
+                              {isMuted ? (
+                                <>
+                                  <Volume2 className="w-3.5 h-3.5" />
+                                  <span>Susturmayı Kaldır</span>
+                                </>
+                              ) : (
+                                <>
+                                  <VolumeX className="w-3.5 h-3.5" />
+                                  <span>Sustur</span>
+                                </>
+                              )}
+                            </button>
+
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => handleAdminModerate(peer, 'ban')}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 transition-colors disabled:opacity-50"
+                            >
+                              <Ban className="w-3.5 h-3.5" />
+                              <span>Banla</span>
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* DOSYA OKUYUCU / ÖNİZLEYİCİ MODALI (.png, .jpg, .txt) */}
       {previewModal && (
         <div
@@ -1426,11 +1860,13 @@ export default function App() {
             {peers.map((peer) => {
               const isSelectedDm = activeTabId === peer.id;
               const isOnline = Boolean(peer.online);
+              const isMuted = Boolean(peer.is_muted);
 
               return (
                 <li
                   key={peer.id}
                   onClick={() => handleOpenDmTab(peer)}
+                  onContextMenu={(e) => handleOpenPeerMenu(e, peer)}
                   className={`p-2.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between group ${
                     isSelectedDm
                       ? 'bg-zinc-800/90 border-zinc-700 text-white shadow-sm'
@@ -1456,33 +1892,61 @@ export default function App() {
                       />
                     </div>
                     <div className="truncate">
-                      <div
-                        className={`text-sm font-medium truncate ${
-                          isOnline ? 'text-zinc-200' : 'text-zinc-400'
-                        }`}
-                      >
-                        {peer.username}
+                      <div className="flex items-center gap-1.5">
+                        <span
+                          className={`text-sm font-medium truncate ${
+                            isOnline ? 'text-zinc-200' : 'text-zinc-400'
+                          }`}
+                        >
+                          {peer.username}
+                        </span>
+                        {isMuted && (
+                          <span title="Susturulmuş kullanıcı">
+                            <BellOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                          </span>
+                        )}
                       </div>
                       <div className="text-[11px] text-zinc-500 font-mono truncate">
                         {isOnline ? peer.ip : `${peer.ip} • Çevrimdışı`}
                       </div>
                     </div>
                   </div>
-                  <span className="text-[10px] font-medium text-zinc-400 opacity-0 group-hover:opacity-100 bg-zinc-800 px-2 py-0.5 rounded-md transition-opacity">
-                    DM
-                  </span>
+
+                  <button
+                    type="button"
+                    onClick={(e) => handleOpenPeerMenu(e, peer)}
+                    title="Kişi Seçenekleri"
+                    className="p-1.5 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800 transition-colors shrink-0"
+                  >
+                    <MoreVertical className="w-4 h-4" />
+                  </button>
                 </li>
               );
             })}
           </ul>
         </div>
 
-        <div className="p-3.5 border-t border-zinc-800/80 bg-zinc-950/40 flex items-center justify-between text-xs text-zinc-500">
-          <span className="flex items-center gap-1.5">
-            <Lock className="w-3.5 h-3.5 text-emerald-500/80" />
-            E2E Şifreleme Aktif
-          </span>
-          <span className="font-mono text-[11px] text-zinc-600">P2P</span>
+        {/* Alt Bölüm: Admin Panel Butonu ve Şifreleme Bilgisi */}
+        <div className="p-3.5 border-t border-zinc-800/80 bg-zinc-950/40 space-y-2.5">
+          <button
+            type="button"
+            onClick={handleOpenAdminModal}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/15 border border-amber-500/25 text-xs font-medium text-amber-300 transition-colors"
+          >
+            <span className="flex items-center gap-2">
+              <ShieldAlert className="w-3.5 h-3.5 text-amber-400" />
+              <span>Admin Panel</span>
+            </span>
+            <Lock className="w-3 h-3 text-amber-400/80" />
+          </button>
+
+          <div className="flex items-center justify-between text-xs text-zinc-500 px-1">
+            <span className="flex items-center gap-1.5">
+              <Lock className="w-3.5 h-3.5 text-emerald-500/80" />
+              E2E Şifreleme Aktif
+            </span>
+            <span className="font-mono text-[11px] text-zinc-600">P2P</span>
+          </div>
         </div>
       </aside>
 
@@ -1561,6 +2025,17 @@ export default function App() {
                 >
                   <Clock className="w-3 h-3" />
                   <span>Çevrimdışı • Kuyruk Modu</span>
+                </span>
+              )}
+
+              {/* Kullanıcının Kendisi Admin Tarafından Susturulduysa Bilgi Rozeti */}
+              {isSelfMuted && (
+                <span
+                  title="Admin tarafından susturuldunuz; gönderdiğiniz mesajlar ağa iletilmeyebilir."
+                  className="inline-flex items-center gap-1.5 text-[11px] font-medium px-2.5 py-0.5 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-300"
+                >
+                  <VolumeX className="w-3 h-3 text-rose-400" />
+                  <span>Admin Tarafından Susturuldunuz</span>
                 </span>
               )}
             </div>
@@ -1802,13 +2277,15 @@ export default function App() {
                 if (handled) e.preventDefault();
               }}
               placeholder={
-                pendingImage
-                  ? 'Ekran görüntüsünü göndermek için Enter’a basın...'
-                  : activeTab.isGroup
-                    ? 'Gruba mesaj yazın, ekran görüntüsü yapıştırın (Ctrl+V) veya /help deneyin...'
-                    : activePeer && !activePeer.online
-                      ? `@${activeTab.title} çevrimdışı — mesajınız kuyruğa alınacak...`
-                      : `@${activeTab.title} kullanıcısına X25519 şifreli mesaj yazın...`
+                isSelfMuted
+                  ? 'Admin tarafından susturuldunuz...'
+                  : pendingImage
+                    ? 'Ekran görüntüsünü göndermek için Enter’a basın...'
+                    : activeTab.isGroup
+                      ? 'Gruba mesaj yazın, ekran görüntüsü yapıştırın (Ctrl+V) veya /help deneyin...'
+                      : activePeer && !activePeer.online
+                        ? `@${activeTab.title} çevrimdışı — mesajınız kuyruğa alınacak...`
+                        : `@${activeTab.title} kullanıcısına X25519 şifreli mesaj yazın...`
               }
               className="flex-1 bg-zinc-900/90 border border-zinc-800 rounded-xl px-4 py-3 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-500/50 focus:ring-2 focus:ring-emerald-500/10 transition-all"
             />

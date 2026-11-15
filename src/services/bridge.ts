@@ -7,6 +7,7 @@ export interface Peer {
   ip: string;
   public_key?: number[];
   online?: boolean;
+  is_muted?: boolean;
 }
 
 export interface ReceivedMessage {
@@ -50,6 +51,14 @@ export interface FilePreviewResponse {
   file_size: number;
 }
 
+export interface AdminNotice {
+  action: "ban" | "mute" | "unmute" | string;
+  is_self?: boolean;
+  target_id?: string;
+  target_name?: string;
+  reason?: string;
+}
+
 export const bridge = {
   joinRoom: async (username: string, roomPassword: string): Promise<void> => {
     await invoke("join_room", { username, roomPassword });
@@ -81,6 +90,26 @@ export const bridge = {
       fileName,
       base64Data,
     });
+  },
+
+  setPeerMuted: async (peerId: string, isMuted: boolean): Promise<void> => {
+    await invoke("set_peer_muted", { peerId, isMuted });
+  },
+
+  removePeer: async (peerId: string): Promise<void> => {
+    await invoke("remove_peer", { peerId });
+  },
+
+  verifyAdminPassword: async (password: string): Promise<boolean> => {
+    return await invoke<boolean>("verify_admin_password", { password });
+  },
+
+  adminModerateUser: async (
+    adminPassword: string,
+    targetId: string,
+    action: "mute" | "unmute" | "ban"
+  ): Promise<void> => {
+    await invoke("admin_moderate_user", { adminPassword, targetId, action });
   },
 
   onPeersUpdated: async (callback: (peers: Peer[]) => void): Promise<UnlistenFn> => {
@@ -115,6 +144,12 @@ export const bridge = {
 
   onMessageStatus: async (callback: (st: MessageStatus) => void): Promise<UnlistenFn> => {
     return await listen<MessageStatus>("message-status", (event) => {
+      callback(event.payload);
+    });
+  },
+
+  onAdminNotice: async (callback: (notice: AdminNotice) => void): Promise<UnlistenFn> => {
+    return await listen<AdminNotice>("admin-notice", (event) => {
       callback(event.payload);
     });
   }
