@@ -8,6 +8,7 @@ export interface Peer {
   public_key?: number[];
   online?: boolean;
   is_muted?: boolean;
+  avatar?: string | null;
 }
 
 export interface ReceivedMessage {
@@ -57,6 +58,14 @@ export interface AdminNotice {
   target_id?: string;
   target_name?: string;
   reason?: string;
+}
+
+export interface TypingPayload {
+  sender_id: string;
+  sender_name: string;
+  is_typing: boolean;
+  is_private: boolean;
+  avatar?: string | null;
 }
 
 export const bridge = {
@@ -112,6 +121,18 @@ export const bridge = {
     await invoke("admin_moderate_user", { adminPassword, targetId, action });
   },
 
+  setAvatar: async (avatarBase64: string | null): Promise<void> => {
+    await invoke("set_avatar", { avatarBase64 });
+  },
+
+  getMyAvatar: async (): Promise<string | null> => {
+    return await invoke<string | null>("get_my_avatar");
+  },
+
+  sendTyping: async (targetId: string | null, isTyping: boolean): Promise<void> => {
+    await invoke("send_typing", { targetId, isTyping });
+  },
+
   onPeersUpdated: async (callback: (peers: Peer[]) => void): Promise<UnlistenFn> => {
     return await listen<Peer[]>("peers-updated", (event) => {
       callback(event.payload);
@@ -152,5 +173,11 @@ export const bridge = {
     return await listen<AdminNotice>("admin-notice", (event) => {
       callback(event.payload);
     });
-  }
+  },
+
+  onPeerTyping: async (callback: (payload: TypingPayload) => void): Promise<UnlistenFn> => {
+    return await listen<TypingPayload>("peer-typing", (event) => {
+      callback(event.payload);
+    });
+  },
 };

@@ -4,6 +4,7 @@ import {
   useRef,
   FormEvent,
   MouseEvent,
+  ChangeEvent,
   KeyboardEvent as ReactKeyboardEvent
 } from 'react';
 import {
@@ -42,17 +43,19 @@ import {
   Trash2,
   Ban,
   VolumeX,
-  Volume2
+  Volume2,
+  Camera
 } from 'lucide-react';
 import { UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
-import { bridge, Peer, FilePreviewResponse } from './services/bridge';
+import { bridge, Peer, FilePreviewResponse, TypingPayload } from './services/bridge';
 
 type MessageDeliveryStatus = 'queued' | 'sent' | 'delivered' | 'read';
 
 interface ExtendedPeer extends Peer {
   is_muted?: boolean;
+  avatar?: string | null;
 }
 
 interface AdminNoticePayload {
@@ -67,6 +70,13 @@ interface PeerContextMenuState {
   peer: ExtendedPeer;
   x: number;
   y: number;
+}
+
+interface ActiveTyper {
+  sender_id: string;
+  sender_name: string;
+  is_private: boolean;
+  avatar?: string | null;
 }
 
 interface ChatTab {
@@ -216,12 +226,97 @@ function mergeMessageStatus(
   return incoming;
 }
 
+// Görseli Canvas ile maksimum 256x256 boyutuna küçültüp JPEG Base64 üretir
+function compressAvatarToBase64(file: File, maxSize = 256): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Görsel dosyası okunamadı.'));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error('Geçersiz görsel formatı.'));
+      img.onload = () => {
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxSize || height > maxSize) {
+          if (width > height) {
+            height = Math.round((height * maxSize) / width);
+            width = maxSize;
+          } else {
+            width = Math.round((width * maxSize) / height);
+            height = maxSize;
+          }
+        }
+
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Canvas bağlamı oluşturulamadı.'));
+          return;
+        }
+
+        ctx.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', 0.82));
+      };
+      img.src = reader.result as string;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// Yuvarlak Profil Fotoğrafı / Baş Harf Rozeti Bileşeni
+function UserAvatar({
+  name,
+  avatar,
+  sizeClass = 'w-8 h-8 text-xs',
+  dimmed = false,
+  ringClass = ''
+}: {
+  name: string;
+  avatar?: string | null;
+  sizeClass?: string;
+  dimmed?: boolean;
+  ringClass?: string;
+}) {
+  const initials = (name || '?').trim().slice(0, 2).toUpperCase();
+
+  if (avatar) {
+    return (
+      <img
+        src={avatar}
+        alt={name}
+        className={`${sizeClass} rounded-full object-cover border border-zinc-700/80 shrink-0 ${
+          dimmed ? 'opacity-65 grayscale-[30%]' : ''
+        } ${ringClass}`}
+      />
+    );
+  }
+
+  return (
+    <div
+      className={`${sizeClass} rounded-full border flex items-center justify-center font-semibold uppercase shrink-0 select-none ${
+        dimmed
+          ? 'bg-zinc-900/90 border-zinc-800 text-zinc-500'
+          : 'bg-zinc-800 border-zinc-700/80 text-zinc-200'
+      } ${ringClass}`}
+    >
+      {initials}
+    </div>
+  );
+}
+
 export default function App() {
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [username, setUsername] = useState('');
   const [roomPassword, setRoomPassword] = useState('');
   const [uptimeSeconds, setUptimeSeconds] = useState(0);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Kullanıcı Profil Fotoğrafı State'leri
+  const [myAvatar, setMyAvatar] = useState<string | null>(null);
+  const [isUpdatingAvatar, setIsUpdatingAvatar] = useState(false);
 
   const [peers, setPeers] = useState<ExtendedPeer[]>([]);
   const [tabs, setTabs] = useState<ChatTab[]>([
@@ -232,6 +327,9 @@ export default function App() {
     [GROUP_TAB_ID]: []
   });
   const [inputText, setInputText] = useState('');
+
+  // Anlık "Yazıyor..." (peer-typing) State'i: key = `${is_private ? 'dm' : 'group'}:${sender_id}`
+  const [typingMap, setTypingMap] = useState<Record<string, ActiveTyper>>({});
 
   // Sürükle-Bırak ve Ctrl+K Komut Paleti State'leri
   const [isDragging, setIsDragging] = useState(false);
@@ -261,11 +359,21 @@ export default function App() {
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const paletteInputRef = useRef<HTMLInputElement | null>(null);
   const messageInputRef = useRef<HTMLInputElement | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
 
   // Event'lerin invoke dönüşünden önce gelme ihtimaline karşı durum tamponu
   const earlyStatusMapRef = useRef(new Map());
   // Aynı mesaj için tekrar markAsRead çağrılmasını önleyen takip kümesi
   const sentReadReceiptsRef = useRef<Set<string>>(new Set());
+
+  // Yazma durumu (send_typing) throttle & timeout referansları
+  const lastTypingSentAtRef = useRef<number>(0);
+  const isCurrentlyTypingRef = useRef<boolean>(false);
+  const activeTypingTargetRef = useRef<string | null>(null);
+  const stopTypingTimerRef = useRef<number | null>(null);
+
+  // Karşı taraftan gelen peer-typing 3.5 sn otomatik gizleme zamanlayıcıları
+  const remoteTypingTimersRef = useRef<Record<string, number>>({});
 
   useEffect(() => {
     activeTabRef.current = activeTabId;
@@ -273,7 +381,20 @@ export default function App() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [histories, activeTabId]);
+  }, [histories, activeTabId, typingMap]);
+
+  // --- SAYFA AÇILIŞINDA KAYITLI PROFİL FOTOĞRAFINI YÜKLE ---
+  useEffect(() => {
+    if (typeof bridge.getMyAvatar !== 'function') return;
+    bridge
+      .getMyAvatar()
+      .then((savedAvatar) => {
+        if (savedAvatar) setMyAvatar(savedAvatar);
+      })
+      .catch((err) => {
+        console.error('Kayıtlı profil fotoğrafı alınamadı:', err);
+      });
+  }, [isLoggedIn]);
 
   // --- AÇIK KİŞİ MENÜSÜNÜ DIŞARI TIKLANINCA KAPAT ---
   useEffect(() => {
@@ -357,6 +478,95 @@ export default function App() {
       setTimeout(() => paletteInputRef.current?.focus(), 20);
     }
   }, [isPaletteOpen]);
+
+  // --- YAZIYOR... (SEND_TYPING) YÖNETİM YARDIMCILARI ---
+  const flushStopTyping = () => {
+    if (stopTypingTimerRef.current !== null) {
+      window.clearTimeout(stopTypingTimerRef.current);
+      stopTypingTimerRef.current = null;
+    }
+
+    if (isCurrentlyTypingRef.current) {
+      const prevTarget = activeTypingTargetRef.current;
+      isCurrentlyTypingRef.current = false;
+      lastTypingSentAtRef.current = 0;
+      if (typeof bridge.sendTyping === 'function') {
+        bridge.sendTyping(prevTarget, false).catch(() => {});
+      }
+    }
+  };
+
+  const handleMessageInputChange = (value: string) => {
+    setInputText(value);
+
+    if (!isLoggedIn || typeof bridge.sendTyping !== 'function') return;
+
+    const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
+
+    // Input tamamen boşaltıldıysa anında isTyping: false gönder
+    if (!value.trim()) {
+      flushStopTyping();
+      return;
+    }
+
+    // Farklı sekmeye geçildiyse önceki hedefteki yazıyor sinyalini kapat
+    if (isCurrentlyTypingRef.current && activeTypingTargetRef.current !== targetId) {
+      flushStopTyping();
+    }
+
+    const now = Date.now();
+    activeTypingTargetRef.current = targetId;
+
+    // 1.5 saniyelik throttle ile isTyping: true gönder
+    if (!isCurrentlyTypingRef.current || now - lastTypingSentAtRef.current >= 1500) {
+      isCurrentlyTypingRef.current = true;
+      lastTypingSentAtRef.current = now;
+      bridge.sendTyping(targetId, true).catch(() => {});
+    }
+
+    // Yazma durduktan 2.5 saniye sonra isTyping: false gönder
+    if (stopTypingTimerRef.current !== null) {
+      window.clearTimeout(stopTypingTimerRef.current);
+    }
+    stopTypingTimerRef.current = window.setTimeout(() => {
+      flushStopTyping();
+    }, 2500);
+  };
+
+  // --- PROFİL FOTOĞRAFI SEÇME / KALDIRMA ---
+  const handleAvatarFileSelected = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setIsUpdatingAvatar(true);
+    try {
+      const compressedDataUrl = await compressAvatarToBase64(file, 256);
+      await bridge.setAvatar(compressedDataUrl);
+      setMyAvatar(compressedDataUrl);
+    } catch (err) {
+      console.error('Profil fotoğrafı güncellenemedi:', err);
+      alert(typeof err === 'string' ? err : 'Profil fotoğrafı güncellenemedi.');
+    } finally {
+      setIsUpdatingAvatar(false);
+    }
+  };
+
+  const handleRemoveMyAvatar = async (e: MouseEvent) => {
+    e.stopPropagation();
+    if (!myAvatar || isUpdatingAvatar) return;
+
+    setIsUpdatingAvatar(true);
+    try {
+      await bridge.setAvatar(null);
+      setMyAvatar(null);
+    } catch (err) {
+      console.error('Profil fotoğrafı kaldırılamadı:', err);
+      alert('Profil fotoğrafı kaldırılırken hata oluştu.');
+    } finally {
+      setIsUpdatingAvatar(false);
+    }
+  };
 
   // --- CTRL + V PANO (CLIPBOARD) EKRAN GÖRÜNTÜSÜ YAKALAMA ---
   const processClipboardItems = (items: DataTransferItemList | undefined): boolean => {
@@ -512,7 +722,7 @@ export default function App() {
     };
   }, [isLoggedIn, username]);
 
-  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, STATUS, ACK, READ, ADMIN NOTICE) ---
+  // --- EVENT LİSTENER KURULUMU (PEERS, MESSAGES, FILES, STATUS, ACK, READ, ADMIN, TYPING) ---
   useEffect(() => {
     if (!isLoggedIn) return;
 
@@ -523,6 +733,7 @@ export default function App() {
     let unlistenAck: UnlistenFn | undefined;
     let unlistenRead: UnlistenFn | undefined;
     let unlistenAdminNotice: UnlistenFn | undefined;
+    let unlistenPeerTyping: UnlistenFn | undefined;
 
     const applyStatusUpdates = (updates: Array<{ msgId: string; status: MessageDeliveryStatus }>) => {
       if (updates.length === 0) return;
@@ -562,6 +773,19 @@ export default function App() {
       });
     };
 
+    const removeTypingEntry = (key: string) => {
+      if (remoteTypingTimersRef.current[key]) {
+        window.clearTimeout(remoteTypingTimersRef.current[key]);
+        delete remoteTypingTimersRef.current[key];
+      }
+      setTypingMap((prev) => {
+        if (!prev[key]) return prev;
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    };
+
     const handleIncomingItem = (
       targetTabId: string,
       tabTitle: string,
@@ -570,6 +794,9 @@ export default function App() {
       notifTitle: string,
       notifBody: string
     ) => {
+      // Karşı taraftan mesaj geldiğinde yazıyor göstergesini hemen temizle
+      removeTypingEntry(`${isPrivate ? 'dm' : 'group'}:${newMsg.sender_id}`);
+
       setTabs((prevTabs) => {
         const exists = prevTabs.some((t) => t.id === targetTabId);
         const isCurrentlyActive = activeTabRef.current === targetTabId;
@@ -724,6 +951,40 @@ export default function App() {
             }
           });
         }
+
+        if (typeof bridge.onPeerTyping === 'function') {
+          unlistenPeerTyping = await bridge.onPeerTyping((rawTyping) => {
+            const payload = rawTyping as unknown as TypingPayload;
+            if (!payload?.sender_id) return;
+
+            const isPrivate = Boolean(payload.is_private);
+            const key = `${isPrivate ? 'dm' : 'group'}:${payload.sender_id}`;
+
+            if (!payload.is_typing) {
+              removeTypingEntry(key);
+              return;
+            }
+
+            if (remoteTypingTimersRef.current[key]) {
+              window.clearTimeout(remoteTypingTimersRef.current[key]);
+            }
+
+            setTypingMap((prev) => ({
+              ...prev,
+              [key]: {
+                sender_id: payload.sender_id,
+                sender_name: payload.sender_name || payload.sender_id,
+                is_private: isPrivate,
+                avatar: payload.avatar ?? null
+              }
+            }));
+
+            // 3.5 saniye yeni sinyal gelmezse otomatik gizle
+            remoteTypingTimersRef.current[key] = window.setTimeout(() => {
+              removeTypingEntry(key);
+            }, 3500);
+          });
+        }
       } catch (error) {
         console.error('Listener başlatılırken hata oluştu:', error);
       }
@@ -739,6 +1000,9 @@ export default function App() {
       if (unlistenAck) unlistenAck();
       if (unlistenRead) unlistenRead();
       if (unlistenAdminNotice) unlistenAdminNotice();
+      if (unlistenPeerTyping) unlistenPeerTyping();
+      Object.values(remoteTypingTimersRef.current).forEach((id) => window.clearTimeout(id));
+      remoteTypingTimersRef.current = {};
     };
   }, [isLoggedIn]);
 
@@ -785,6 +1049,7 @@ export default function App() {
       setTabs((prev) => prev.filter((t) => t.id !== peer.id));
 
       if (activeTabId === peer.id) {
+        flushStopTyping();
         setActiveTabId(GROUP_TAB_ID);
         setTabs((prev) =>
           prev.map((t) => (t.id === GROUP_TAB_ID ? { ...t, hasUnread: false } : t))
@@ -846,6 +1111,7 @@ export default function App() {
           return next;
         });
         if (activeTabId === targetPeer.id) {
+          flushStopTyping();
           setActiveTabId(GROUP_TAB_ID);
         }
       } else {
@@ -928,8 +1194,12 @@ export default function App() {
       }
 
       await bridge.joinRoom(username, roomPassword);
+      if (myAvatar && typeof bridge.setAvatar === 'function') {
+        bridge.setAvatar(myAvatar).catch(() => {});
+      }
       earlyStatusMapRef.current.clear();
       sentReadReceiptsRef.current.clear();
+      setTypingMap({});
       setIsSelfMuted(false);
       setVerifiedAdminPassword(null);
       setIsLoggedIn(true);
@@ -959,6 +1229,7 @@ export default function App() {
   };
 
   const handleDisconnect = () => {
+    flushStopTyping();
     setIsLoggedIn(false);
     setIsPaletteOpen(false);
     setIsDragging(false);
@@ -969,6 +1240,7 @@ export default function App() {
     setVerifiedAdminPassword(null);
     setAdminPasswordInput('');
     setIsSelfMuted(false);
+    setTypingMap({});
     earlyStatusMapRef.current.clear();
     sentReadReceiptsRef.current.clear();
     setPeers([]);
@@ -980,6 +1252,9 @@ export default function App() {
 
   // --- SEKME YÖNETİMİ ---
   const handleSelectTab = (tabId: string) => {
+    if (tabId !== activeTabId) {
+      flushStopTyping();
+    }
     setActiveTabId(tabId);
     setTabs((prev) =>
       prev.map((t) => (t.id === tabId ? { ...t, hasUnread: false } : t))
@@ -987,6 +1262,9 @@ export default function App() {
   };
 
   const handleOpenDmTab = (peer: ExtendedPeer) => {
+    if (peer.id !== activeTabId) {
+      flushStopTyping();
+    }
     setTabs((prev) => {
       const exists = prev.some((t) => t.id === peer.id);
       if (exists) {
@@ -1033,6 +1311,7 @@ export default function App() {
 
     setTabs((prev) => prev.filter((t) => t.id !== tabId));
     if (activeTabId === tabId) {
+      flushStopTyping();
       setActiveTabId(GROUP_TAB_ID);
       setTabs((prev) =>
         prev.map((t) => (t.id === GROUP_TAB_ID ? { ...t, hasUnread: false } : t))
@@ -1088,6 +1367,9 @@ export default function App() {
   const handleSendMessage = async (e: FormEvent) => {
     e.preventDefault();
     const targetId = activeTabId === GROUP_TAB_ID ? null : activeTabId;
+
+    // Mesaj gönderildiğinde yazıyor sinyalini hemen kapat
+    flushStopTyping();
 
     // 1. Panodan yapıştırılmış bekleyen ekran görüntüsü varsa gönder
     if (pendingImage && !isSendingImage) {
@@ -1285,6 +1567,24 @@ export default function App() {
   const activePeer = peers.find((p) => p.id === activeTabId);
   const onlinePeersCount = peers.filter((p) => p.online).length;
 
+  // Aktif sekme için yazıyor göstergesi verileri
+  const dmTyper: ActiveTyper | undefined = !activeTab.isGroup
+    ? typingMap[`dm:${activeTabId}`]
+    : undefined;
+
+  const groupTypers: ActiveTyper[] = activeTab.isGroup
+    ? Object.values(typingMap)
+        .filter((t) => !t.is_private)
+        .map((t) => {
+          const matchedPeer = peers.find((p) => p.id === t.sender_id);
+          return {
+            ...t,
+            sender_name: matchedPeer?.username || t.sender_name,
+            avatar: matchedPeer?.avatar ?? t.avatar
+          };
+        })
+    : [];
+
   // --- CTRL + K HIZLI GEÇİŞ ÖĞELERİ ---
   const quickItems: QuickActionItem[] = [
     ...tabs.map((t) => ({
@@ -1301,6 +1601,13 @@ export default function App() {
       category: 'Cihazlar' as const,
       onSelect: () => handleOpenDmTab(p)
     })),
+    {
+      id: 'cmd-avatar',
+      label: 'Profil Fotoğrafını Değiştir...',
+      sublabel: '256x256 JPEG formatında avatar yükle',
+      category: 'Komutlar',
+      onSelect: () => avatarInputRef.current?.click()
+    },
     {
       id: 'cmd-admin',
       label: 'Admin Paneli — Moderasyon Yönetimi',
@@ -1366,6 +1673,15 @@ export default function App() {
   // --- EKRAN 2: MODERN SEKMELİ SOHBET ARAYÜZÜ ---
   return (
     <div className="flex h-screen w-screen bg-[#09090b] text-zinc-100 font-sans select-none relative">
+      {/* Gizli Avatar Dosya Seçici Input */}
+      <input
+        ref={avatarInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleAvatarFileSelected}
+        className="hidden"
+      />
+
       {/* AĞDAKİ CİHAZLAR ÜÇ NOKTA / SAĞ TIK AÇILIR MENÜSÜ */}
       {peerMenu && (
         <div
@@ -1416,7 +1732,6 @@ export default function App() {
             onClick={(e) => e.stopPropagation()}
             className="w-full max-w-lg bg-zinc-900 border border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
           >
-            {/* Modal Üst Başlık */}
             <div className="px-5 py-4 border-b border-zinc-800 bg-zinc-950/70 flex items-center justify-between">
               <div className="flex items-center gap-2.5">
                 <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center">
@@ -1442,7 +1757,6 @@ export default function App() {
               </button>
             </div>
 
-            {/* Modal İçerik */}
             {!verifiedAdminPassword ? (
               <form onSubmit={handleVerifyAdmin} className="p-6 space-y-4">
                 <div className="space-y-1.5">
@@ -1518,9 +1832,12 @@ export default function App() {
                         >
                           <div className="flex items-center gap-3 min-w-0">
                             <div className="relative shrink-0">
-                              <div className="w-9 h-9 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center text-xs font-semibold uppercase text-zinc-200">
-                                {peer.username.slice(0, 2)}
-                              </div>
+                              <UserAvatar
+                                name={peer.username}
+                                avatar={peer.avatar}
+                                sizeClass="w-9 h-9 text-xs"
+                                dimmed={!peer.online}
+                              />
                               <span
                                 className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-zinc-950 ${
                                   peer.online ? 'bg-emerald-400' : 'bg-zinc-500'
@@ -1815,8 +2132,54 @@ export default function App() {
           </span>
         </div>
 
-        {/* Hızlı Arama Butonu */}
+        {/* Kendi Profil Fotoğrafı (Avatar) Kartı */}
         <div className="px-3.5 pt-3.5">
+          <div className="p-2.5 rounded-xl bg-zinc-900/70 border border-zinc-800/90 flex items-center justify-between gap-2.5">
+            <div
+              onClick={() => !isUpdatingAvatar && avatarInputRef.current?.click()}
+              title="Profil fotoğrafı seç veya değiştir (Max 256x256)"
+              className="flex items-center gap-2.5 min-w-0 cursor-pointer group"
+            >
+              <div className="relative shrink-0">
+                <UserAvatar
+                  name={username}
+                  avatar={myAvatar}
+                  sizeClass="w-9 h-9 text-xs"
+                  ringClass="group-hover:border-emerald-500/60 transition-colors"
+                />
+                <span className="absolute -bottom-0.5 -right-0.5 w-4 h-4 rounded-full bg-zinc-900 border border-zinc-700 flex items-center justify-center text-zinc-300 group-hover:text-emerald-400 group-hover:border-emerald-500/50 transition-colors">
+                  {isUpdatingAvatar ? (
+                    <Loader2 className="w-2.5 h-2.5 animate-spin text-emerald-400" />
+                  ) : (
+                    <Camera className="w-2.5 h-2.5" />
+                  )}
+                </span>
+              </div>
+
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-zinc-100 truncate">{username}</div>
+                <div className="text-[11px] text-zinc-500 group-hover:text-emerald-400 transition-colors truncate">
+                  {myAvatar ? 'Fotoğrafı değiştir' : 'Profil fotoğrafı ekle'}
+                </div>
+              </div>
+            </div>
+
+            {myAvatar && (
+              <button
+                type="button"
+                disabled={isUpdatingAvatar}
+                onClick={handleRemoveMyAvatar}
+                title="Profil fotoğrafını kaldır"
+                className="p-1.5 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors shrink-0"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Hızlı Arama Butonu */}
+        <div className="px-3.5 pt-2.5">
           <button
             type="button"
             onClick={() => {
@@ -1875,15 +2238,12 @@ export default function App() {
                 >
                   <div className="flex items-center gap-3 min-w-0">
                     <div className="relative shrink-0">
-                      <div
-                        className={`w-8 h-8 rounded-lg border flex items-center justify-center text-xs font-semibold uppercase transition-colors ${
-                          isOnline
-                            ? 'bg-zinc-800 border-zinc-700/80 text-zinc-200'
-                            : 'bg-zinc-900/80 border-zinc-800 text-zinc-500'
-                        }`}
-                      >
-                        {peer.username.slice(0, 2)}
-                      </div>
+                      <UserAvatar
+                        name={peer.username}
+                        avatar={peer.avatar}
+                        sizeClass="w-8 h-8 text-xs"
+                        dimmed={!isOnline}
+                      />
                       <span
                         title={isOnline ? 'Çevrimiçi' : 'Çevrimdışı (Mesajlar kuyruğa alınır)'}
                         className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-[#0c0c0f] ${
@@ -2006,7 +2366,6 @@ export default function App() {
                 {activeTab.isGroup ? 'Grup Ağı' : activePeer ? activePeer.ip : 'Özel Mesaj'}
               </span>
 
-              {/* DM Sekmelerinde X25519 E2EE Aktif Kilit Rozeti */}
               {!activeTab.isGroup && (
                 <span
                   title="X25519 Elliptic-Curve Diffie-Hellman Uçtan Uca Anahtar Değişimi Aktif"
@@ -2017,7 +2376,6 @@ export default function App() {
                 </span>
               )}
 
-              {/* Çevrimdışı Peer Kuyruk Uyarısı */}
               {!activeTab.isGroup && activePeer && !activePeer.online && (
                 <span
                   title="Kullanıcı şu an çevrimdışı; gönderilen mesaj ve dosyalar çevrimiçi olduğu an otomatik iletilir."
@@ -2028,7 +2386,6 @@ export default function App() {
                 </span>
               )}
 
-              {/* Kullanıcının Kendisi Admin Tarafından Susturulduysa Bilgi Rozeti */}
               {isSelfMuted && (
                 <span
                   title="Admin tarafından susturuldunuz; gönderdiğiniz mesajlar ağa iletilmeyebilir."
@@ -2050,8 +2407,9 @@ export default function App() {
               <span>{formatUptime(uptimeSeconds)}</span>
             </div>
 
-            <div className="text-xs font-medium text-zinc-300 bg-zinc-900/90 border border-zinc-800 px-3 py-1.5 rounded-lg">
-              {username}
+            <div className="flex items-center gap-2 text-xs font-medium text-zinc-300 bg-zinc-900/90 border border-zinc-800 pl-1.5 pr-3 py-1 rounded-lg">
+              <UserAvatar name={username} avatar={myAvatar} sizeClass="w-5 h-5 text-[10px]" />
+              <span>{username}</span>
             </div>
 
             <button
@@ -2090,143 +2448,231 @@ export default function App() {
 
             const hasCode = !msg.file && isCodeMessage(msg.text);
             const canPreview = msg.file ? isPreviewableFile(msg.file.fileName) : false;
+            const senderPeer = !msg.isMine
+              ? peers.find((p) => p.id === msg.sender_id)
+              : undefined;
+            const senderAvatar = msg.isMine ? myAvatar : senderPeer?.avatar ?? null;
+            const senderDisplayName = msg.isMine
+              ? username
+              : senderPeer?.username || msg.sender_name;
 
             return (
               <div
                 key={msg.id}
-                className={`flex flex-col ${msg.isMine ? 'items-end' : 'items-start'}`}
+                className={`flex items-end gap-2.5 ${
+                  msg.isMine ? 'flex-row-reverse' : 'flex-row'
+                }`}
               >
-                {/* Gönderen, Saat ve 4 Aşamalı Teslim/Okundu İkonu */}
-                <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px] text-zinc-500">
-                  {!msg.isMine && (
-                    <span className="font-medium text-zinc-300 mr-0.5">{msg.sender_name}</span>
-                  )}
-                  <span className="font-mono">{msg.timestamp}</span>
-                  {msg.isMine && renderDeliveryStatus(msg.status)}
-                </div>
+                {/* Gönderen Yuvarlak Avatar (28px) */}
+                <UserAvatar
+                  name={senderDisplayName}
+                  avatar={senderAvatar}
+                  sizeClass="w-7 h-7 text-[11px]"
+                />
 
-                {msg.file ? (
-                  <div
-                    className={`w-full max-w-md p-3.5 rounded-2xl border transition-all ${
-                      msg.isMine
-                        ? 'bg-emerald-500/10 border-emerald-500/25'
-                        : 'bg-zinc-900/90 border-zinc-800'
-                    }`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <div
-                        onClick={() => canPreview && handleOpenFilePreview(msg.file!)}
-                        className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
-                          canPreview ? 'cursor-pointer hover:opacity-80' : ''
-                        } ${
-                          msg.isMine
-                            ? 'bg-emerald-500/20 text-emerald-400'
-                            : 'bg-zinc-800 text-zinc-300'
-                        }`}
-                      >
-                        <FileText className="w-5 h-5" />
-                      </div>
+                <div
+                  className={`flex flex-col max-w-[75%] ${
+                    msg.isMine ? 'items-end' : 'items-start'
+                  }`}
+                >
+                  {/* Gönderen, Saat ve 4 Aşamalı Teslim/Okundu İkonu */}
+                  <div className="flex items-center gap-1.5 mb-1 px-1 text-[11px] text-zinc-500">
+                    {!msg.isMine && (
+                      <span className="font-medium text-zinc-300 mr-0.5">{senderDisplayName}</span>
+                    )}
+                    <span className="font-mono">{msg.timestamp}</span>
+                    {msg.isMine && renderDeliveryStatus(msg.status)}
+                  </div>
 
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 text-[11px] font-medium mb-0.5">
-                          {msg.file.direction === 'sent' ? (
-                            <span className="text-emerald-400 flex items-center gap-0.5">
-                              <ArrowUpRight className="w-3 h-3" /> Dosya Gönderildi
-                            </span>
-                          ) : (
-                            <span className="text-sky-400 flex items-center gap-0.5">
-                              <ArrowDownLeft className="w-3 h-3" /> Dosya Alındı
-                            </span>
-                          )}
-                        </div>
+                  {msg.file ? (
+                    <div
+                      className={`w-full max-w-md p-3.5 rounded-2xl border transition-all ${
+                        msg.isMine
+                          ? 'bg-emerald-500/10 border-emerald-500/25'
+                          : 'bg-zinc-900/90 border-zinc-800'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3">
                         <div
                           onClick={() => canPreview && handleOpenFilePreview(msg.file!)}
-                          className={`text-sm font-medium text-zinc-100 truncate ${
-                            canPreview ? 'cursor-pointer hover:text-emerald-400 transition-colors' : ''
+                          className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                            canPreview ? 'cursor-pointer hover:opacity-80' : ''
+                          } ${
+                            msg.isMine
+                              ? 'bg-emerald-500/20 text-emerald-400'
+                              : 'bg-zinc-800 text-zinc-300'
                           }`}
-                          title={msg.file.fileName}
                         >
-                          {msg.file.fileName}
+                          <FileText className="w-5 h-5" />
                         </div>
-                        <div className="text-[11px] font-mono text-zinc-500 truncate mt-1" title={msg.file.filePath}>
-                          {msg.file.filePath}
-                        </div>
-                      </div>
 
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        {canPreview && (
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 text-[11px] font-medium mb-0.5">
+                            {msg.file.direction === 'sent' ? (
+                              <span className="text-emerald-400 flex items-center gap-0.5">
+                                <ArrowUpRight className="w-3 h-3" /> Dosya Gönderildi
+                              </span>
+                            ) : (
+                              <span className="text-sky-400 flex items-center gap-0.5">
+                                <ArrowDownLeft className="w-3 h-3" /> Dosya Alındı
+                              </span>
+                            )}
+                          </div>
+                          <div
+                            onClick={() => canPreview && handleOpenFilePreview(msg.file!)}
+                            className={`text-sm font-medium text-zinc-100 truncate ${
+                              canPreview ? 'cursor-pointer hover:text-emerald-400 transition-colors' : ''
+                            }`}
+                            title={msg.file.fileName}
+                          >
+                            {msg.file.fileName}
+                          </div>
+                          <div
+                            className="text-[11px] font-mono text-zinc-500 truncate mt-1"
+                            title={msg.file.filePath}
+                          >
+                            {msg.file.filePath}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {canPreview && (
+                            <button
+                              type="button"
+                              onClick={() => handleOpenFilePreview(msg.file!)}
+                              title="Dosyayı Oku / Önizle"
+                              className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/25 text-emerald-300 text-xs font-medium transition-colors"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>Önizle</span>
+                            </button>
+                          )}
+
                           <button
                             type="button"
-                            onClick={() => handleOpenFilePreview(msg.file!)}
-                            title="Dosyayı Oku / Önizle"
-                            className="flex items-center gap-1 px-2.5 py-2 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/25 text-emerald-300 text-xs font-medium transition-colors"
+                            onClick={() => handleCopy(msg.id, msg.file!.filePath)}
+                            title="Dosya yolunu kopyala"
+                            className="p-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors"
                           >
-                            <Eye className="w-3.5 h-3.5" />
-                            <span>Önizle</span>
+                            {copiedId === msg.id ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
                           </button>
-                        )}
-
-                        <button
-                          type="button"
-                          onClick={() => handleCopy(msg.id, msg.file!.filePath)}
-                          title="Dosya yolunu kopyala"
-                          className="p-2 rounded-lg bg-zinc-800/80 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 transition-colors"
-                        >
-                          {copiedId === msg.id ? (
-                            <Check className="w-3.5 h-3.5 text-emerald-400" />
-                          ) : (
-                            <Copy className="w-3.5 h-3.5" />
-                          )}
-                        </button>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ) : (
-                  <div
-                    className={`group relative max-w-[75%] rounded-2xl border transition-all ${
-                      hasCode
-                        ? 'bg-zinc-950 border-zinc-800 p-0 overflow-hidden'
-                        : msg.isMine
-                          ? 'bg-emerald-500/15 border-emerald-500/25 text-zinc-100 px-4 py-2.5'
-                          : 'bg-zinc-900 border-zinc-800/90 text-zinc-200 px-4 py-2.5'
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => handleCopy(msg.id, hasCode ? cleanCodeContent(msg.text) : msg.text)}
-                      title="Metni kopyala"
-                      className="absolute top-2 right-2 p-1.5 rounded-lg bg-zinc-800/90 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity border border-zinc-700/60"
+                  ) : (
+                    <div
+                      className={`group relative w-full rounded-2xl border transition-all ${
+                        hasCode
+                          ? 'bg-zinc-950 border-zinc-800 p-0 overflow-hidden'
+                          : msg.isMine
+                            ? 'bg-emerald-500/15 border-emerald-500/25 text-zinc-100 px-4 py-2.5'
+                            : 'bg-zinc-900 border-zinc-800/90 text-zinc-200 px-4 py-2.5'
+                      }`}
                     >
-                      {copiedId === msg.id ? (
-                        <Check className="w-3.5 h-3.5 text-emerald-400" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(msg.id, hasCode ? cleanCodeContent(msg.text) : msg.text)}
+                        title="Metni kopyala"
+                        className="absolute top-2 right-2 p-1.5 rounded-lg bg-zinc-800/90 hover:bg-zinc-700 text-zinc-400 hover:text-zinc-100 opacity-0 group-hover:opacity-100 transition-opacity border border-zinc-700/60"
+                      >
+                        {copiedId === msg.id ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                      </button>
 
-                    {hasCode ? (
-                      <div>
-                        <div className="px-3.5 py-1.5 bg-zinc-900/90 border-b border-zinc-800 flex items-center gap-1.5 text-[11px] font-mono text-zinc-400">
-                          <Terminal className="w-3 h-3 text-emerald-400" />
-                          <span>snippet</span>
+                      {hasCode ? (
+                        <div>
+                          <div className="px-3.5 py-1.5 bg-zinc-900/90 border-b border-zinc-800 flex items-center gap-1.5 text-[11px] font-mono text-zinc-400">
+                            <Terminal className="w-3 h-3 text-emerald-400" />
+                            <span>snippet</span>
+                          </div>
+                          <pre className="p-3.5 pr-10 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed overflow-x-auto">
+                            {cleanCodeContent(msg.text)}
+                          </pre>
                         </div>
-                        <pre className="p-3.5 pr-10 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words leading-relaxed overflow-x-auto">
-                          {cleanCodeContent(msg.text)}
-                        </pre>
-                      </div>
-                    ) : (
-                      <p className="text-sm leading-relaxed break-words pr-6">{msg.text}</p>
-                    )}
-                  </div>
-                )}
+                      ) : (
+                        <p className="text-sm leading-relaxed break-words pr-6">{msg.text}</p>
+                      )}
+                    </div>
+                  )}
+                </div>
               </div>
             );
           })}
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Alt Mesaj Gönderme Çubuğu + Ctrl+V Pano Görsel Önizleme */}
-        <div className="p-4 bg-[#0c0c0f] border-t border-zinc-800/80 space-y-3">
+        {/* Alt Mesaj Gönderme Çubuğu + Anlık "Yazıyor..." Göstergesi + Ctrl+V Önizleme */}
+        <div className="px-4 pt-2.5 pb-4 bg-[#0c0c0f] border-t border-zinc-800/80 space-y-2.5">
+          {/* DM "Yazıyor..." Göstergesi */}
+          {!activeTab.isGroup && dmTyper && (
+            <div className="flex items-center gap-2 px-1 text-xs text-zinc-400">
+              <UserAvatar
+                name={activePeer?.username || dmTyper.sender_name}
+                avatar={activePeer?.avatar ?? dmTyper.avatar}
+                sizeClass="w-5 h-5 text-[10px]"
+              />
+              <span className="font-medium text-zinc-300">
+                {activePeer?.username || dmTyper.sender_name}
+              </span>
+              <span>yazıyor</span>
+              <span className="inline-flex items-center gap-0.5 text-emerald-400">
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce [animation-delay:-0.3s]" />
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce [animation-delay:-0.15s]" />
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce" />
+              </span>
+            </div>
+          )}
+
+          {/* # BROADCAST_ALL Çoklu "Yazıyor..." Göstergesi (Avatar Stack) */}
+          {activeTab.isGroup && groupTypers.length > 0 && (
+            <div className="flex items-center gap-2 px-1 text-xs text-zinc-400">
+              <div className="flex items-center -space-x-2">
+                {groupTypers.slice(0, 4).map((typer) => (
+                  <UserAvatar
+                    key={typer.sender_id}
+                    name={typer.sender_name}
+                    avatar={typer.avatar}
+                    sizeClass="w-5 h-5 text-[10px]"
+                    ringClass="ring-2 ring-[#0c0c0f]"
+                  />
+                ))}
+              </div>
+
+              {groupTypers.length === 1 ? (
+                <span>
+                  <strong className="font-medium text-zinc-300">
+                    {groupTypers[0].sender_name}
+                  </strong>{' '}
+                  yazıyor
+                </span>
+              ) : (
+                <span>
+                  <strong className="font-medium text-zinc-300">
+                    {groupTypers[0].sender_name}
+                  </strong>{' '}
+                  ve{' '}
+                  <strong className="font-medium text-zinc-300">
+                    {groupTypers.length - 1} kişi daha
+                  </strong>{' '}
+                  yazıyor
+                </span>
+              )}
+
+              <span className="inline-flex items-center gap-0.5 text-emerald-400">
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce [animation-delay:-0.3s]" />
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce [animation-delay:-0.15s]" />
+                <span className="w-1 h-1 rounded-full bg-emerald-400 animate-bounce" />
+              </span>
+            </div>
+          )}
+
           {pendingImage && (
             <div className="flex items-center justify-between gap-3 p-2.5 rounded-xl bg-zinc-900 border border-emerald-500/30">
               <div className="flex items-center gap-3 min-w-0">
@@ -2271,7 +2717,7 @@ export default function App() {
               ref={messageInputRef}
               type="text"
               value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
+              onChange={(e) => handleMessageInputChange(e.target.value)}
               onPaste={(e) => {
                 const handled = processClipboardItems(e.clipboardData?.items);
                 if (handled) e.preventDefault();
