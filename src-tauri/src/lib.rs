@@ -16,7 +16,7 @@ mod discovery;
 mod transport;
 
 // Uygulamaya gömülü Admin Panel şifresi
-const ADMIN_SECRET_PASSWORD: &str = "LABCHAT_ADMIN_2026";
+const ADMIN_SECRET_PASSWORD: &str = "YENI_SIFREN";
 
 fn compute_admin_signature(password: &str) -> String {
     blake3::hash(format!("labchat_admin_sig::{}", password).as_bytes())
