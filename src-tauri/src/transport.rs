@@ -14,9 +14,29 @@ use tokio::sync::Mutex;
 
 const TCP_PORT: u16 = 54322;
 
+#[derive(Serialize, Clone)]
+pub struct TypingPayload {
+    pub sender_id: String,
+    pub sender_name: String,
+    pub is_typing: bool,
+    pub is_private: bool,
+    pub avatar: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind")]
 pub enum NetworkPacket {
+    Typing {
+        sender_id: String,
+        sender_name: String,
+        is_typing: bool,
+        is_private: bool,
+    },
+    ProfileUpdate {
+        sender_id: String,
+        sender_name: String,
+        avatar: Option<String>,
+    },
     Text {
         msg_id: String,
         sender_id: String,
@@ -305,6 +325,70 @@ pub async fn start_tcp_server(
                                     serde_json::from_slice::<NetworkPacket>(&decrypted_bytes)
                                 {
                                     match packet {
+                                        NetworkPacket::Typing {
+                                            sender_id,
+                                            sender_name,
+                                            is_typing,
+                                            is_private,
+                                        } => {
+                                            if banned_clone.lock().await.contains(&sender_id)
+                                                || g_muted_clone.lock().await.contains(&sender_id)
+                                            {
+                                                return;
+                                            }
+                                            let avatar = {
+                                                let mut p_map = peers_clone.lock().await;
+                                                let entry = p_map.entry(sender_id.clone()).or_insert_with(|| Peer {
+                                                    id: sender_id.clone(),
+                                                    username: sender_name.clone(),
+                                                    ip: remote_ip.clone(),
+                                                    public_key: [0u8; 32],
+                                                    online: true,
+                                                    last_seen: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                                    is_muted: false,
+                                                    avatar: None,
+                                                });
+                                                entry.ip = remote_ip.clone();
+                                                entry.online = true;
+                                                entry.last_seen = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                                entry.avatar.clone()
+                                            };
+                                            let _ = app_clone.emit("peer-typing", TypingPayload {
+                                                sender_id,
+                                                sender_name,
+                                                is_typing,
+                                                is_private,
+                                                avatar,
+                                            });
+                                        }
+                                        NetworkPacket::ProfileUpdate {
+                                            sender_id,
+                                            sender_name,
+                                            avatar,
+                                        } => {
+                                            if banned_clone.lock().await.contains(&sender_id) {
+                                                return;
+                                            }
+                                            let mut p_map = peers_clone.lock().await;
+                                            let entry = p_map.entry(sender_id.clone()).or_insert_with(|| Peer {
+                                                id: sender_id.clone(),
+                                                username: sender_name.clone(),
+                                                ip: remote_ip.clone(),
+                                                public_key: [0u8; 32],
+                                                online: true,
+                                                last_seen: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+                                                is_muted: false,
+                                                avatar: avatar.clone(),
+                                            });
+                                            entry.ip = remote_ip.clone();
+                                            entry.username = sender_name;
+                                            entry.avatar = avatar;
+                                            entry.online = true;
+                                            entry.last_seen = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                                            let peer_list: Vec<Peer> = p_map.values().cloned().collect();
+                                            let _ = app_clone.emit("peers-updated", peer_list);
+                                            save_known_peers(&p_map).await;
+                                        }
                                         NetworkPacket::Text {
                                             msg_id,
                                             sender_id,
@@ -329,6 +413,7 @@ pub async fn start_tcp_server(
                                                     online: true,
                                                     last_seen: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                                                     is_muted: false,
+                                                    avatar: None,
                                                 });
                                                 entry.ip = remote_ip.clone();
                                                 entry.username = sender_name.clone();

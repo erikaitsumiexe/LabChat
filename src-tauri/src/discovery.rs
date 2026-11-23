@@ -21,6 +21,8 @@ pub struct Peer {
     pub last_seen: u64,
     #[serde(default)]
     pub is_muted: bool,
+    #[serde(default)]
+    pub avatar: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -158,6 +160,7 @@ pub async fn start_discovery(
                             online: true,
                             last_seen: current_ts,
                             is_muted,
+                            avatar: p_map.get(&packet.id).and_then(|p| p.avatar.clone()),
                         };
 
                         p_map.insert(packet.id, peer_obj.clone());

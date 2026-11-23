@@ -27,6 +27,7 @@ fn compute_admin_signature(password: &str) -> String {
 struct AppState {
     my_id: Mutex<String>,
     my_username: Mutex<String>,
+    my_avatar: Mutex<Option<String>>,
     room_key: Mutex<[u8; 32]>,
     crypto_session: Mutex<Option<CryptoSession>>,
     peers: Arc<Mutex<HashMap<String, Peer>>>,
@@ -616,6 +617,114 @@ async fn send_clipboard_image(
     Ok(saved_path_str)
 }
 
+#[tauri::command]
+async fn set_avatar(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    avatar_base64: Option<String>,
+) -> Result<(), String> {
+    if let Some(ref data) = avatar_base64 {
+        if data.len() > 2 * 1024 * 1024 {
+            return Err("Profil fotoğrafı en fazla 1.5 MB olabilir.".to_string());
+        }
+    }
+
+    *state.my_avatar.lock().await = avatar_base64.clone();
+    let dir = std::env::temp_dir().join("labchat_state");
+    let _ = std::fs::create_dir_all(&dir);
+    let avatar_path = dir.join("my_avatar.txt");
+    if let Some(ref data) = avatar_base64 {
+        let _ = fs::write(&avatar_path, data).await;
+    } else {
+        let _ = fs::remove_file(&avatar_path).await;
+    }
+
+    let my_id = state.my_id.lock().await.clone();
+    let my_username = state.my_username.lock().await.clone();
+    let room_key = *state.room_key.lock().await;
+    let peers_snapshot: Vec<Peer> = state.peers.lock().await.values().cloned().collect();
+
+    let packet = NetworkPacket::ProfileUpdate {
+        sender_id: my_id,
+        sender_name: my_username,
+        avatar: avatar_base64.clone(),
+    };
+
+    for peer in peers_snapshot {
+        if peer.online {
+            let ip = peer.ip.clone();
+            let pkt = packet.clone();
+            tokio::spawn(async move {
+                let _ = transport::send_packet(&ip, room_key, &pkt).await;
+            });
+        }
+    }
+
+    let _ = app.emit("my-avatar-updated", avatar_base64);
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_my_avatar(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let current = state.my_avatar.lock().await.clone();
+    if current.is_some() {
+        return Ok(current);
+    }
+    let path = std::env::temp_dir().join("labchat_state").join("my_avatar.txt");
+    if let Ok(data) = fs::read_to_string(path).await {
+        if !data.trim().is_empty() {
+            *state.my_avatar.lock().await = Some(data.clone());
+            return Ok(Some(data));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+async fn send_typing(
+    state: State<'_, AppState>,
+    target_id: Option<String>,
+    is_typing: bool,
+) -> Result<(), String> {
+    let my_id = state.my_id.lock().await.clone();
+    if my_id.is_empty() {
+        return Ok(());
+    }
+    let my_username = state.my_username.lock().await.clone();
+    let room_key = *state.room_key.lock().await;
+    let is_private = target_id.is_some();
+
+    let packet = NetworkPacket::Typing {
+        sender_id: my_id,
+        sender_name: my_username,
+        is_typing,
+        is_private,
+    };
+
+    let peers_map = state.peers.lock().await;
+    if let Some(tid) = target_id {
+        if let Some(peer) = peers_map.get(&tid) {
+            if peer.online {
+                let ip = peer.ip.clone();
+                tokio::spawn(async move {
+                    let _ = transport::send_packet(&ip, room_key, &packet).await;
+                });
+            }
+        }
+    } else {
+        for peer in peers_map.values() {
+            if peer.online {
+                let ip = peer.ip.clone();
+                let pkt = packet.clone();
+                tokio::spawn(async move {
+                    let _ = transport::send_packet(&ip, room_key, &pkt).await;
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -625,6 +734,7 @@ pub fn run() {
         .manage(AppState {
             my_id: Mutex::new(String::new()),
             my_username: Mutex::new(String::new()),
+            my_avatar: Mutex::new(None),
             room_key: Mutex::new([0u8; 32]),
             crypto_session: Mutex::new(None),
             peers: Arc::new(Mutex::new(HashMap::new())),
@@ -644,7 +754,10 @@ pub fn run() {
             verify_admin_password,
             admin_moderate_user,
             set_peer_muted,
-            remove_peer
+            remove_peer,
+            set_avatar,
+            get_my_avatar,
+            send_typing
         ])
         .run(tauri::generate_context!())
         .expect("Tauri backend motoru çöktü!");
