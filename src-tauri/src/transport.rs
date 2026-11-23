@@ -261,7 +261,8 @@ pub async fn start_tcp_server(
 
     tokio::spawn(async move {
         loop {
-            if let Ok((mut socket, _addr)) = listener.accept().await {
+            if let Ok((mut socket, peer_addr)) = listener.accept().await {
+                let remote_ip = peer_addr.ip().to_string();
                 let app_clone = app.clone();
                 let my_id_clone = my_id.clone();
                 let room_key_clone = room_key;
@@ -319,8 +320,23 @@ pub async fn start_tcp_server(
                                             }
 
                                             let sender_ip = {
-                                                let p_map = peers_clone.lock().await;
-                                                p_map.get(&sender_id).map(|p| p.ip.clone())
+                                                let mut p_map = peers_clone.lock().await;
+                                                let entry = p_map.entry(sender_id.clone()).or_insert_with(|| Peer {
+                                                    id: sender_id.clone(),
+                                                    username: sender_name.clone(),
+                                                    ip: remote_ip.clone(),
+                                                    public_key: [0u8; 32],
+                                                    online: true,
+                                                    last_seen: now_secs(),
+                                                    is_muted: false,
+                                                });
+                                                entry.ip = remote_ip.clone();
+                                                entry.username = sender_name.clone();
+                                                entry.online = true;
+                                                entry.last_seen = now_secs();
+                                                let peer_list: Vec<Peer> = p_map.values().cloned().collect();
+                                                let _ = app_clone.emit("peers-updated", peer_list);
+                                                Some(remote_ip.clone())
                                             };
 
                                             if !l_muted_clone.lock().await.contains(&sender_id) {
