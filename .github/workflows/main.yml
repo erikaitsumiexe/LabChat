@@ -73,12 +73,3 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: ${{ matrix.args }}
-```
-
-### Önemli Notlar ve Kullanım
-* **CachyOS Uyumluluğu:** CachyOS (Arch Linux tabanlı) üzerinde bağımlılık çakışması yaşamadan doğrudan çalışması için Linux tarafında **`--bundles appimage,deb`** yapılandırıldı. CachyOS'ta `.AppImage` dosyasına çalıştırma izni (`chmod +x`) verip doğrudan açabilirsin.
-* **Sürüm Numarası Eşitleme:** `tauri-action` derleme sırasında `src-tauri/tauri.conf.json` ve `package.json` içindeki `"version"` alanını okur; bu dosyalardaki sürümü de `"0.1.1"` yapman paket isimlerinin `v0.1.1` ile birebir eşleşmesini sağlar.
-* **Tetikleme:** Dosyayı `.github/workflows/release.yml` yoluna kaydettikten sonra terminalden aşağıdaki komutlarla `v0.1.1` etiketini gönderdiğinde derleme ve Release oluşturma otomatik başlar:
-  ```bash
-  git tag v0.1.1
-  git push origin v0.1.1
