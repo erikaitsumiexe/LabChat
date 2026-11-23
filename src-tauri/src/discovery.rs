@@ -187,9 +187,19 @@ pub async fn start_discovery(
             let mut changed = false;
 
             for peer in p_map.values_mut() {
-                if peer.online && current_ts.saturating_sub(peer.last_seen) > 10 {
-                    peer.online = false;
-                    changed = true;
+                if peer.online && current_ts.saturating_sub(peer.last_seen) > 30 {
+                    let tcp_alive = if let Ok(sock_addr) = format!("{}:54322", peer.ip).parse() {
+                        std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(1500)).is_ok()
+                    } else {
+                        false
+                    };
+
+                    if tcp_alive {
+                        peer.last_seen = current_ts;
+                    } else if current_ts.saturating_sub(peer.last_seen) > 300 {
+                        peer.online = false;
+                        changed = true;
+                    }
                 }
             }
 
