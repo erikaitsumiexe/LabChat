@@ -64,6 +64,22 @@ pub async fn save_known_peers(peers: &HashMap<String, Peer>) {
     }
 }
 
+fn get_broadcast_targets() -> Vec<String> {
+    let mut targets = vec![format!("255.255.255.255:{}", DISCOVERY_PORT)];
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:80").is_ok() {
+            if let Ok(std::net::SocketAddr::V4(addr)) = sock.local_addr() {
+                let octets = addr.ip().octets();
+                let subnet_bcast = format!("{}.{}.{}.255:{}", octets[0], octets[1], octets[2], DISCOVERY_PORT);
+                if !targets.contains(&subnet_bcast) {
+                    targets.push(subnet_bcast);
+                }
+            }
+        }
+    }
+    targets
+}
+
 pub async fn start_discovery(
     app: AppHandle,
     my_id: String,
@@ -193,9 +209,9 @@ pub async fn start_discovery(
         };
         let msg = serde_json::to_string(&announce).unwrap();
         loop {
-            let _ = send_socket
-                .send_to(msg.as_bytes(), format!("255.255.255.255:{}", DISCOVERY_PORT))
-                .await;
+            for target in get_broadcast_targets() {
+                let _ = send_socket.send_to(msg.as_bytes(), &target).await;
+            }
             sleep(Duration::from_secs(3)).await;
         }
     });

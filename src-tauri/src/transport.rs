@@ -327,13 +327,13 @@ pub async fn start_tcp_server(
                                                     ip: remote_ip.clone(),
                                                     public_key: [0u8; 32],
                                                     online: true,
-                                                    last_seen: now_secs(),
+                                                    last_seen: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
                                                     is_muted: false,
                                                 });
                                                 entry.ip = remote_ip.clone();
                                                 entry.username = sender_name.clone();
                                                 entry.online = true;
-                                                entry.last_seen = now_secs();
+                                                entry.last_seen = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                                                 let peer_list: Vec<Peer> = p_map.values().cloned().collect();
                                                 let _ = app_clone.emit("peers-updated", peer_list);
                                                 Some(remote_ip.clone())
